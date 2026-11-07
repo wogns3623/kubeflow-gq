@@ -1,0 +1,770 @@
+#!/usr/bin/env python3
+"""gq: run GPU/CPU jobs on Kubeflow from a notebook.
+
+gq only reads and writes files under $GQ_ROOT (default ~/gq) on the shared PVC.
+The gqd daemon picks them up and does the Kubernetes work, so gq needs no cluster
+access. `--local` jobs run on this machine without gqd. See README.md.
+"""
+import argparse
+import datetime as dt
+import getpass
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+ID_RE = re.compile(r"^\d{6}-\d{6}-[0-9a-f]{4}(-\d{1,3})?$")
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]{0,63}$")
+MEM_RE = re.compile(r"^\d+(\.\d+)?([KMGTP]i?)?$")
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+TERMINAL = frozenset({"rejected", "expired", "succeeded", "failed", "timeout", "lost", "killed"})
+ENV_DROP = {"CUDA_VISIBLE_DEVICES", "HOSTNAME", "PWD", "OLDPWD", "SHLVL", "NB_PREFIX", "_"}
+ENV_DROP_PREFIX = ("KUBERNETES_", "NVIDIA_", "SSH_", "JPY_", "JUPYTER_", "KF_", "TMUX", "TERM", "GQ_", "BASH_FUNC_")
+HEARTBEAT_STALE = 30
+RECENT = 24 * 3600
+
+
+def root():
+    return os.environ.get("GQ_ROOT") or os.path.expanduser("~/gq")
+
+
+def mounts():
+    """(mounts, excluded): paths Job pods mount like the notebook does, and notebook volumes they
+    cannot mount (ReadWriteOnce/local). From $GQ_MOUNTS/$GQ_EXCLUDED, else gqd's heartbeat, else ~."""
+    env = os.environ.get("GQ_MOUNTS")
+    if env:
+        return ([m for m in env.split(":") if m], [m for m in os.environ.get("GQ_EXCLUDED", "").split(":") if m])
+    hb = read_json(os.path.join(root(), "gqd.heartbeat")) or {}
+    return hb.get("mounts") or [os.path.expanduser("~")], hb.get("excluded") or []
+
+
+def poll_interval():
+    return float(os.environ.get("GQ_POLL", "2"))
+
+
+def job_dir(rid):
+    return os.path.join(root(), "jobs", rid)
+
+
+# ---------------------------------------------------------------- helpers
+
+def now_utc():
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+
+
+def iso(t):
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ") if t else None
+
+
+def parse_ts(s):
+    return dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc) if s else None
+
+
+def age(s):
+    t = parse_ts(s)
+    return (now_utc() - t).total_seconds() if t else None
+
+
+class Usage(Exception):
+    pass
+
+
+def warn(msg):
+    print("gq: warning: " + msg, file=sys.stderr)
+
+
+def parse_duration(s):
+    s = str(s).strip()
+    if s.isdigit():
+        return int(s)
+    parts = re.findall(r"(\d+)([smhd])", s)
+    if not parts or "".join(n + u for n, u in parts) != s:
+        raise Usage("bad duration %r (use e.g. 90s, 30m, 4h, 1h30m, 2d)" % s)
+    return sum(int(n) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[u] for n, u in parts)
+
+
+def fmt_dur(sec):
+    if sec is None:
+        return "-"
+    sec = int(sec)
+    for unit, div, sub, subdiv in (("d", 86400, "h", 3600), ("h", 3600, "m", 60), ("m", 60, "s", 1)):
+        if sec >= div:
+            return "%d%s%02d%s" % (sec // div, unit, (sec % div) // subdiv, sub)
+    return "%ds" % sec
+
+
+def parse_gpus(s):
+    m = re.fullmatch(r"(\d+)(?:-(\d+))?", str(s).strip())
+    if not m:
+        raise Usage("--gpus expects N or LO-HI, got %r" % s)
+    lo = int(m.group(1))
+    hi = int(m.group(2)) if m.group(2) else lo
+    if lo > hi or (m.group(2) and lo < 1):
+        raise Usage("--gpus range must be 1 <= LO <= HI")
+    return lo, hi
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_json(path, obj):
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=1)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def read_exit(rid):
+    try:
+        with open(os.path.join(job_dir(rid), "exit")) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def touch_marker(rid, kind):
+    spool = os.path.join(root(), "spool")
+    tmp = os.path.join(spool, ".%s.%s.tmp" % (rid, kind))
+    open(tmp, "w").close()
+    os.replace(tmp, os.path.join(spool, "%s.%s" % (rid, kind)))  # atomic: gqd never sees a half request
+
+
+def my_owner():
+    raw = os.environ.get("GQ_OWNER") or "%s:%d" % (getpass.getuser(), os.getppid())
+    return re.sub(r"[^A-Za-z0-9._:@-]", "_", raw)[:63]
+
+
+def heartbeat_warning():
+    hb = read_json(os.path.join(root(), "gqd.heartbeat"))
+    a = age(hb.get("ts")) if hb else None
+    if a is None or a > HEARTBEAT_STALE:
+        warn("gqd heartbeat is %s; pod jobs stay 'submitted' until gqd runs (README: Troubleshooting)"
+             % ("missing" if a is None else "%ds old" % a))
+    elif hb.get("dry_run"):
+        warn("gqd runs in --dry-run mode: Jobs are not really created")
+
+
+def proc_start(pid):
+    """Process start time from /proc (guards against PID reuse); None where /proc is missing."""
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return int(f.read().rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def alive(pid, start=None):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return start is None or proc_start(pid) in (None, start)
+
+
+# ---------------------------------------------------------------- status
+
+def load_status(rid):
+    st = read_json(os.path.join(job_dir(rid), "status.json"))
+    if st is None:
+        return {"id": rid, "state": "unknown", "reason": "NoStatus", "message": "status.json missing or unreadable"}
+    if st.get("backend") == "local" and st.get("state") not in TERMINAL:
+        st = refresh_local(rid, st)
+    return st
+
+
+def refresh_local(rid, st):
+    """Local jobs have no daemon: detect a dead supervisor when someone looks."""
+    if read_exit(rid) is not None or st.get("host", socket.gethostname()) != socket.gethostname():
+        return st  # finished (supervisor writes the final status) or not checkable from here
+    pid, sup = st.get("pid"), st.get("supervisor")
+    if pid is None:
+        if (age(st.get("submitted")) or 0) < 30:
+            return st
+        reason, msg = "NoSupervisor", "the local supervisor never started"
+    elif alive(pid, st.get("pid_start")) or (sup and alive(sup, st.get("supervisor_start"))):
+        return st  # still running, or the supervisor is about to record the result
+    else:
+        reason, msg = "Gone", "process ended without an exit code (machine restarted?)"
+    again = read_json(os.path.join(job_dir(rid), "status.json")) or st
+    if again.get("state") in TERMINAL or read_exit(rid) is not None:
+        return again
+    st.update(state="lost", reason=reason, message=msg, finished=iso(now_utc()))
+    write_json(os.path.join(job_dir(rid), "status.json"), st)
+    return st
+
+
+def expand(rid):
+    """A job id, or an array group id -> its task ids."""
+    if not ID_RE.match(rid):
+        raise Usage("bad job id %r" % rid)
+    if os.path.isdir(job_dir(rid)):
+        return [rid]
+    tasks = []
+    try:
+        names = os.listdir(os.path.join(root(), "jobs"))
+    except FileNotFoundError:
+        names = []
+    for name in names:
+        if name.startswith(rid + "-") and ID_RE.match(name):
+            tasks.append(name)
+    if not tasks:
+        raise Usage("no such job: %s" % rid)
+    return sorted(tasks, key=lambda n: int(n.rsplit("-", 1)[1]))
+
+
+def result_code(sts):
+    """Exit code for wait/run: 0 if all succeeded, else the first failure (125 if abnormal)."""
+    bad = [s for s in sts if s.get("state") != "succeeded"]
+    if not bad:
+        return 0
+    first = min(bad, key=lambda s: s.get("finished") or "~")
+    code = first.get("exit_code")
+    if first.get("state") != "failed" or not isinstance(code, int) or code in (0, 124, 125) or code > 255:
+        code = 125
+    print(json.dumps({k: first.get(k) for k in ("id", "state", "reason", "message", "exit_code")}), file=sys.stderr)
+    return code
+
+
+def summary(rid, sts):
+    if len(sts) == 1 and sts[0]["id"] == rid:
+        return {k: sts[0].get(k) for k in ("id", "state", "reason", "exit_code")}
+    counts = {}
+    for s in sts:
+        counts[s.get("state")] = counts.get(s.get("state"), 0) + 1
+    return {"id": rid, "tasks": len(sts), "states": counts}
+
+
+# ---------------------------------------------------------------- logs
+
+def emit(data):
+    buf = getattr(sys.stdout, "buffer", None)
+    if buf is not None:
+        buf.write(data)
+        buf.flush()
+    else:
+        sys.stdout.write(data.decode("utf-8", "replace"))
+        sys.stdout.flush()
+
+
+class Tailer:
+    def __init__(self, ids, from_tail=None):
+        self.ids = ids
+        self.prefix = len(ids) > 1
+        self.off = {}
+        self.buf = {i: b"" for i in ids}
+        for rid in ids:
+            path = os.path.join(job_dir(rid), "log")
+            self.off[rid] = 0
+            if from_tail is not None and os.path.exists(path):
+                lines, size = tail_lines(path, from_tail)
+                self.off[rid] = size
+                emit(b"".join(self._pre(rid) + ln for ln in lines))
+
+    def _pre(self, rid):
+        return ("[%s] " % rid.rsplit("-", 1)[1]).encode() if self.prefix else b""
+
+    def pump(self, final=False):
+        out = []
+        for rid in self.ids:
+            try:
+                with open(os.path.join(job_dir(rid), "log"), "rb") as f:
+                    f.seek(self.off[rid])
+                    data = f.read()
+            except FileNotFoundError:
+                data = b""
+            self.off[rid] += len(data)
+            data = self.buf[rid] + data
+            lines = data.split(b"\n")
+            self.buf[rid] = lines.pop()
+            out += [self._pre(rid) + ln + b"\n" for ln in lines]
+            if final and self.buf[rid]:
+                out.append(self._pre(rid) + self.buf[rid] + b"\n")
+                self.buf[rid] = b""
+        if out:
+            emit(b"".join(out))
+
+
+def tail_lines(path, n):
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = end = f.tell()
+        data, step = b"", 8192
+        while end > 0 and data.count(b"\n") <= n:
+            take = min(step, end)
+            end -= take
+            f.seek(end)
+            data = f.read(take) + data
+            step *= 2
+    lines = data.splitlines(keepends=True)
+    return (lines[-n:] if n else []), size
+
+
+def follow(ids, tailer, timeout=None):
+    """Stream logs until all ids are terminal. Returns statuses, or None on timeout."""
+    deadline = time.monotonic() + timeout if timeout else None
+    warned = False
+    while True:
+        sts = [load_status(i) for i in ids]
+        if all(s.get("state") in TERMINAL for s in sts):
+            if tailer:
+                time.sleep(min(1.0, poll_interval()))  # let the last bytes land on the PVC
+                tailer.pump(final=True)
+            return sts
+        if not warned and any(s.get("state") == "submitted" and s.get("backend") == "pod" for s in sts):
+            if any((age(s.get("submitted")) or 0) > 10 for s in sts):
+                heartbeat_warning()
+                warned = True
+        if deadline and time.monotonic() > deadline:
+            if tailer:
+                tailer.pump()
+            return None
+        if tailer:
+            tailer.pump()
+        time.sleep(poll_interval())
+
+
+# ---------------------------------------------------------------- local backend
+
+def kill_group(pgid, grace=10.0):
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    end = time.monotonic() + grace
+    while time.monotonic() < end:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.2)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def supervise(rid, seconds):
+    """Detached parent of a local job: enforces --time and records the result."""
+    d = job_dir(rid)
+    status_path = os.path.join(d, "status.json")
+    st = read_json(status_path) or {"id": rid, "backend": "local"}
+    if st.get("state") == "killed":
+        return 0
+    with open(os.path.join(d, "log"), "wb") as logf:
+        child = subprocess.Popen(["bash", os.path.join(d, "run.sh")], stdin=subprocess.DEVNULL, stdout=logf,
+                                 stderr=subprocess.STDOUT, start_new_session=True, env=dict(os.environ, GQ_ID=rid))
+    st.update(state="running", host=socket.gethostname(), pid=child.pid, pid_start=proc_start(child.pid),
+              supervisor=os.getpid(), supervisor_start=proc_start(os.getpid()), started=iso(now_utc()))
+    write_json(status_path, st)
+    timed_out = False
+    try:
+        rc = child.wait(timeout=seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        os.killpg(child.pid, signal.SIGTERM)
+        try:
+            rc = child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(child.pid, signal.SIGKILL)
+            rc = child.wait()
+    try:
+        os.killpg(child.pid, signal.SIGKILL)  # leftovers in the job's process group
+    except (ProcessLookupError, PermissionError):
+        pass
+    code = 124 if timed_out else (rc if rc >= 0 else 128 - rc)
+    tmp = os.path.join(d, ".exit.tmp")
+    with open(tmp, "w") as f:
+        f.write("%d\n" % code)
+    os.replace(tmp, os.path.join(d, "exit"))
+    st = read_json(status_path) or st
+    if st.get("state") == "killed":
+        st.update(exit_code=code)
+    elif timed_out:
+        st.update(state="timeout", reason="TimeLimit", message="ran longer than --time (%ds)" % seconds, exit_code=code)
+    else:
+        st.update(state="succeeded" if code == 0 else "failed", reason=None if code == 0 else "Error", exit_code=code)
+    st["finished"] = st.get("finished") or iso(now_utc())
+    write_json(status_path, st)
+    return 0
+
+
+def launch_local(rid, seconds, extra_env):
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "_supervise", rid, str(seconds)],
+                     start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, close_fds=True, env=dict(os.environ, **extra_env))
+
+
+def kill_local(rid, st):
+    if st.get("host") and st["host"] != socket.gethostname():
+        raise Usage("%s runs on %s; run gq kill there" % (rid, st["host"]))
+    st.update(state="killed", reason="Killed", message="killed by gq kill", finished=iso(now_utc()))
+    write_json(os.path.join(job_dir(rid), "status.json"), st)
+    if st.get("pid") and alive(st["pid"], st.get("pid_start")):
+        kill_group(st["pid"], grace=5.0)
+
+
+# ---------------------------------------------------------------- commands
+
+def capture_env(pairs, clean):
+    env = {} if clean else {k: v for k, v in os.environ.items()
+                            if ENV_NAME_RE.match(k) and k not in ENV_DROP
+                            and not k.startswith(ENV_DROP_PREFIX) and not k.endswith(("_SOCK", "_SOCKET"))}
+    for p in pairs or []:
+        k, sep, v = p.partition("=")
+        if not sep or not ENV_NAME_RE.match(k):
+            raise Usage("--env expects K=V, got %r" % p)
+        env[k] = v
+    return env
+
+
+def render_run_sh(cwd, cmd, env):
+    lines = ["#!/bin/bash", "# generated by gq: environment captured at submit time, then the command"]
+    lines += ["export %s=%s" % (k, shlex.quote(v)) for k, v in sorted(env.items())]
+    lines.append('if [ -z "${OMP_NUM_THREADS:-}" ] && [ -n "${GQ_CPU:-}" ]; then '
+                 'n=$(( GQ_CPU / (${GQ_GPUS:-0} > 0 ? ${GQ_GPUS:-0} : 1) )); '
+                 'export OMP_NUM_THREADS=$(( n > 0 ? n : 1 )); fi')
+    lines.append("cd %s || exit 1" % shlex.quote(cwd))
+    lines.append("exec " + " ".join(shlex.quote(c) for c in cmd))
+    return "\n".join(lines) + "\n"
+
+
+def on_mount(path):
+    """(mapped, shadow): path in its form under a Job mount (e.g. /home/irteam/...) or None,
+    and the excluded mount it sits on, if that is why it is None.
+
+    Images often make /home a symlink (MLXP: /home -> /home1), so os.getcwd() returns
+    /home1/irteam/...; compare real paths but hand gqd and the Job the mount's own prefix.
+    The longest matching mount wins, so an excluded volume nested in an included one counts."""
+    inc, exc = mounts()
+    cands = [(m.rstrip("/") or "/", True) for m in inc] + [(m.rstrip("/") or "/", False) for m in exc]
+    for m, ok in sorted(cands, key=lambda c: len(c[0]), reverse=True):
+        for base, p in ((m, os.path.abspath(path)), (os.path.realpath(m), os.path.realpath(path))):
+            if p == base or p.startswith(base + "/"):
+                return (m + p[len(base):], None) if ok else (None, m)
+    return None, None
+
+
+def new_id():
+    while True:
+        rid = now_utc().strftime("%y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
+        if not os.path.exists(job_dir(rid)) and not os.path.exists(job_dir(rid + "-0")):
+            return rid
+
+
+def cmd_submit(a, follow_logs=False):
+    cmd = a.cmd[1:] if a.cmd and a.cmd[0] == "--" else a.cmd
+    if not cmd:
+        raise Usage("missing command (put it after --)")
+    lo, hi = parse_gpus(a.gpus)
+    if a.local and hi:
+        raise Usage("--local runs on this machine and cannot take --gpus")
+    if a.array is not None and not 1 <= a.array <= 999:
+        raise Usage("--array must be in [1, 999]")
+    seconds, wait_s = parse_duration(a.time), parse_duration(a.wait_timeout)
+    if not NAME_RE.match(a.name):
+        raise Usage("--name: up to 63 characters of [A-Za-z0-9._-]")
+    if a.mem is not None and not MEM_RE.match(a.mem):
+        raise Usage("--mem expects a quantity like 64Gi")
+    if a.cpu is not None and a.cpu <= 0:
+        raise Usage("--cpu must be positive")
+    raw_cwd = a.cwd or os.getcwd()
+    pwd = os.environ.get("PWD")  # logical path from the shell; stale after a chdir without a shell
+    if not a.cwd and pwd and os.path.realpath(pwd) == os.path.realpath(raw_cwd):
+        raw_cwd = pwd
+    cwd, shadow = on_mount(raw_cwd)
+    if cwd is None:
+        if not a.local:
+            if shadow:
+                raise Usage("%s is on a volume Job pods cannot mount (%s is ReadWriteOnce or node-local); "
+                            "move the work to %s, or use --local" % (raw_cwd, shadow, ", ".join(mounts()[0])))
+            raise Usage("--cwd must be on a volume Job pods mount (%s); now %s" % (", ".join(mounts()[0]), raw_cwd))
+        cwd = os.path.abspath(raw_cwd)
+    for sub in ("jobs", "spool"):
+        os.makedirs(os.path.join(root(), sub), exist_ok=True)
+
+    env = capture_env(a.env, a.clean_env)
+    base, n = new_id(), a.array
+    ids = ["%s-%d" % (base, k) for k in range(n)] if n else [base]
+    backend = "local" if a.local else "pod"
+    submitted = iso(now_utc())
+    for k, rid in enumerate(ids):
+        d = job_dir(rid)
+        os.makedirs(d)
+        req = {"id": rid, "name": a.name, "owner": my_owner(), "backend": backend, "gpus": [lo, hi],
+               "cpu": a.cpu, "mem": a.mem, "time": seconds, "wait_timeout": wait_s, "cwd": cwd,
+               "submitted": submitted}
+        if n:
+            req.update(group=base, task_index=k, task_count=n)
+        write_json(os.path.join(d, "request.json"), req)
+        with open(os.path.join(d, "run.sh"), "w") as f:
+            f.write(render_run_sh(cwd, cmd, env))
+        os.chmod(os.path.join(d, "run.sh"), 0o755)
+        st = {k2: req.get(k2) for k2 in ("id", "group", "task_index", "task_count", "name", "owner", "backend",
+                                         "time", "wait_timeout", "cwd", "submitted")}
+        st.update(state="submitted", reason=None, message=None, gpus=None, gpus_requested=[lo, hi], node=None,
+                  started=None, finished=None, exit_code=None)
+        write_json(os.path.join(d, "status.json"), st)
+
+    if a.local:
+        for k, rid in enumerate(ids):
+            launch_local(rid, seconds, {"GQ_TASK_INDEX": str(k), "GQ_TASK_COUNT": str(n)} if n else {})
+        end = time.monotonic() + 5
+        while time.monotonic() < end and not all(load_status(i).get("pid") or load_status(i).get("state") in TERMINAL
+                                                 for i in ids):
+            time.sleep(0.1)
+    else:
+        for rid in ids:
+            touch_marker(rid, "submit")
+        heartbeat_warning()
+
+    out = {"id": base, "state": load_status(ids[0]).get("state") if len(ids) == 1 else "submitted"}
+    if n:
+        out["tasks"] = ids
+    print(json.dumps(out), file=sys.stderr if follow_logs else sys.stdout, flush=True)
+    if not follow_logs:
+        return 0
+    sts = follow(ids, Tailer(ids))
+    print(json.dumps(summary(base, sts)), file=sys.stderr)
+    return result_code(sts)
+
+
+def cmd_run(a):
+    return cmd_submit(a, follow_logs=True)
+
+
+def cmd_status(a):
+    ids = expand(a.id)
+    sts = [load_status(i) for i in ids]
+    if a.json:
+        print(json.dumps(sts[0] if ids == [a.id] else {"id": a.id, "tasks": sts, **summary(a.id, sts)}, indent=1))
+        return 0
+    if ids == [a.id]:
+        st = sts[0]
+        for k in ("id", "name", "owner", "backend", "state", "reason", "message", "queue_position", "gpus",
+                  "gpus_requested", "cpu", "mem", "node", "host", "submitted", "started", "finished", "exit_code"):
+            if st.get(k) not in (None, ""):
+                print("%-15s %s" % (k + ":", st[k]))
+        print("%-15s %s" % ("log:", os.path.join(job_dir(a.id), "log")))
+        return 0
+    print_table(sts)
+    return 0
+
+
+def cmd_wait(a):
+    ids = expand(a.id)
+    sts = follow(ids, None, parse_duration(a.timeout) if a.timeout else None)
+    if sts is None:
+        print(json.dumps({"id": a.id, "state": "waiting", "message": "--timeout reached; the job keeps running"}),
+              file=sys.stderr)
+        return 124
+    print(json.dumps(summary(a.id, sts)))
+    return result_code(sts)
+
+
+def cmd_logs(a):
+    ids = expand(a.id)
+    t = Tailer(ids, from_tail=a.tail)
+    if a.follow:
+        follow(ids, t)
+    else:
+        t.pump(final=True)
+    return 0
+
+
+def row(st):
+    state = st.get("state", "?")
+    gpus = st.get("gpus")
+    if gpus is None:
+        lo, hi = (st.get("gpus_requested") or [0, 0])
+        gpus = ("%d" % lo if lo == hi else "%d-%d" % (lo, hi)) + ("?" if hi else "")
+    if state in ("submitted", "queued", "pending"):
+        t = "wait " + fmt_dur(age(st.get("submitted")))
+    elif state == "running":
+        t = "run " + fmt_dur(age(st.get("started")))
+    elif st.get("started") and st.get("finished"):
+        t = "ran " + fmt_dur((parse_ts(st["finished"]) - parse_ts(st["started"])).total_seconds())
+    else:
+        t = "-"
+    why = st.get("reason") or ""
+    if st.get("message") and state not in ("succeeded",):
+        why = (why + ": " if why else "") + st["message"]
+    if st.get("exit_code") is not None and state != "succeeded":
+        why = "exit %s %s" % (st["exit_code"], why)
+    where = st.get("node") or (("local:" + st["host"]) if st.get("host") else "-")
+    return [st.get("id", "?"), st.get("name") or "-", state, str(gpus), where, t, why[:70]]
+
+
+def print_table(sts):
+    rows = [["ID", "NAME", "STATE", "GPU", "NODE", "TIME", "REASON"]] + [row(s) for s in sts]
+    widths = [max(len(r[i]) for r in rows) for i in range(6)]
+    for r in rows:
+        print("  ".join(c.ljust(widths[i]) for i, c in enumerate(r[:6])) + "  " + r[6])
+
+
+def cmd_ps(a):
+    jobs = os.path.join(root(), "jobs")
+    names = sorted(n for n in os.listdir(jobs) if ID_RE.match(n)) if os.path.isdir(jobs) else []
+    sts = []
+    me = my_owner()
+    for name in names:
+        st = load_status(name)
+        if not a.all and st.get("state") in TERMINAL and (age(st.get("finished")) or 0) > RECENT:
+            continue
+        if a.mine and st.get("owner") != me:
+            continue
+        sts.append(st)
+    if a.json:
+        print(json.dumps(sts, indent=1))
+        return 0
+    cap = read_json(os.path.join(root(), "capacity.json")) or {}
+    free = shutil.disk_usage(root()).free if os.path.isdir(root()) else 0
+    print("gq %s/%s GPU · %s/%s running · queue %s · cluster free GPU %s (max %s on one node) · PVC free %.1fT"
+          % (cap.get("gq_gpus_in_use", "?"), cap.get("gq_gpus_cap", "?"), cap.get("gq_running", "?"),
+             cap.get("gq_max_running", "?"), cap.get("queue_length", "?"), cap.get("total_gpu_free", "?"),
+             cap.get("max_gpu_free_on_node", "?"), free / 2**40))
+    if any(s.get("backend") == "pod" and s.get("state") not in TERMINAL for s in sts):
+        heartbeat_warning()
+    if sts:
+        print_table(sts)
+    else:
+        print("(no jobs%s)" % ("" if a.all else " in the last 24h; --all shows older"))
+    return 0
+
+
+def cmd_kill(a):
+    done, skipped = [], []
+    pod = False
+    for rid in expand(a.id):
+        st = load_status(rid)
+        if st.get("state") in TERMINAL:
+            skipped.append(rid)
+        elif st.get("backend") == "local":
+            kill_local(rid, st)
+            done.append(rid)
+        else:
+            touch_marker(rid, "kill")
+            done.append(rid)
+            pod = True
+    if pod:
+        heartbeat_warning()
+    print(json.dumps({"killed": done, "already_finished": skipped}))
+    return 0
+
+
+def cmd_capacity(a):
+    cap = read_json(os.path.join(root(), "capacity.json"))
+    if cap is None:
+        raise Usage("no capacity.json yet; is gqd running? (README: Troubleshooting)")
+    stale = age(cap.get("updated"))
+    if stale is None or stale > HEARTBEAT_STALE:
+        warn("capacity.json is %s old; gqd may be down" % fmt_dur(stale))
+    scheduler_mode = cap.get("placement") == "scheduler"
+    if a.fit is not None:
+        if scheduler_mode:
+            print(json.dumps({"fit": None, "gpus": a.fit, "message": "no node list configured; free GPUs per node "
+                              "are unknown and the Kubernetes scheduler places jobs"}))
+            return 1
+        fits = sorted((nd for nd in cap["nodes"] if nd["gpu_free"] >= a.fit), key=lambda nd: nd["gpu_free"])
+        print(json.dumps({"fit": bool(fits), "gpus": a.fit, "node": fits[0]["name"] if fits else None,
+                          "max_gpu_free_on_node": cap["max_gpu_free_on_node"], "total_gpu_free": cap["total_gpu_free"]}))
+        return 0 if fits else 1
+    if a.json:
+        print(json.dumps(cap, indent=1))
+        return 0
+    if scheduler_mode:
+        print("no node list configured: per-node free GPUs are unknown; the Kubernetes scheduler places jobs")
+        print("namespace GPU waiting %s · gq %s/%s GPU · %s/%s running · queue %s"
+              % (cap["gpu_waiting"], cap["gq_gpus_in_use"], cap["gq_gpus_cap"], cap["gq_running"],
+                 cap["gq_max_running"], cap["queue_length"]))
+        return 0
+    g = cap.get("node_capacity", {}).get("gpu", "?")
+    print("%-18s %-9s %-13s %-13s %s" % ("NODE", "GPU free", "CPU req free", "MEM req free", "CPU actual"))
+    for nd in cap["nodes"]:
+        actual = "-" if nd.get("cpu_actual") is None else "%g" % nd["cpu_actual"]
+        print("%-18s %-9s %-13s %-13s %s" % (nd["name"], "%s/%s" % (nd["gpu_free"], g), "%g" % nd["cpu_req_free"],
+                                             "%gGi" % nd["mem_req_free_gib"], actual))
+    print("total free %s · max on one node %s · namespace GPU waiting %s · gq %s/%s · estimated (updated %s ago)"
+          % (cap["total_gpu_free"], cap["max_gpu_free_on_node"], cap["gpu_waiting"], cap["gq_gpus_in_use"],
+             cap["gq_gpus_cap"], fmt_dur(stale)))
+    return 0
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="gq", description="Run GPU/CPU jobs on Kubeflow from a notebook (see README.md).")
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    def job_opts(p):
+        p.add_argument("--gpus", default="0", help="N or LO-HI (default 0 = CPU job)")
+        p.add_argument("--array", type=int, help="run the command as N tasks (GQ_TASK_INDEX/GQ_TASK_COUNT)")
+        p.add_argument("--time", required=True, help="run time limit, e.g. 30m, 4h (required)")
+        p.add_argument("--cpu", type=float, help="CPU limit in cores (default: 15 per GPU, 8 for CPU jobs); "
+                                                  "the request stays small (1 core)")
+        p.add_argument("--mem", help="memory limit, e.g. 64Gi (default: 245Gi per GPU, 64Gi for CPU jobs); "
+                                     "the request stays small (4Gi)")
+        p.add_argument("--wait-timeout", default="6h", help="max time from submit to start (default 6h)")
+        p.add_argument("--name", default="", help="short label, visible to the namespace; no secrets")
+        p.add_argument("--local", action="store_true", help="run on this machine instead of a pod")
+        p.add_argument("--env", action="append", metavar="K=V", help="set or override an environment variable")
+        p.add_argument("--clean-env", action="store_true", help="do not pass the current environment")
+        p.add_argument("--cwd", help="working directory (default: current; must be on a mounted volume)")
+        p.add_argument("cmd", nargs=argparse.REMAINDER, help="-- command [args...]")
+
+    job_opts(sub.add_parser("submit", help="queue a job and print its id"))
+    job_opts(sub.add_parser("run", help="submit, stream logs, exit with the job's code"))
+    p = sub.add_parser("status", help="show a job or array group")
+    p.add_argument("id")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("wait", help="wait until a job or group finishes")
+    p.add_argument("id")
+    p.add_argument("--timeout", help="give up waiting after this long (exit 124)")
+    p = sub.add_parser("logs", help="print a job's log")
+    p.add_argument("id")
+    p.add_argument("-f", "--follow", action="store_true")
+    p.add_argument("--tail", type=int, metavar="N")
+    p = sub.add_parser("ps", help="list jobs")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--all", action="store_true", help="include jobs that finished more than 24h ago")
+    p.add_argument("--mine", action="store_true", help="only jobs with my owner ($GQ_OWNER)")
+    p = sub.add_parser("kill", help="stop a job or array group")
+    p.add_argument("id")
+    p = sub.add_parser("capacity", help="free resources per node (estimated by gqd)")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fit", type=int, metavar="N", help="exit 0 if a node has N free GPUs now, else 1")
+    return ap
+
+
+COMMANDS = {"submit": cmd_submit, "run": cmd_run, "status": cmd_status, "wait": cmd_wait, "logs": cmd_logs,
+            "ps": cmd_ps, "kill": cmd_kill, "capacity": cmd_capacity}
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["_supervise"]:
+        return supervise(argv[1], int(argv[2]))
+    a = build_parser().parse_args(argv)
+    try:
+        return COMMANDS[a.command](a)
+    except Usage as e:
+        print("gq: error: %s" % e, file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
