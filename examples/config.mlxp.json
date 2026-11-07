@@ -1,0 +1,54 @@
+{
+  "instance": "alice",
+  "platform": "mlxp",
+  "namespace": "team-ml",
+  "image": "example/mlxp-notebook:cu128",
+  "service_account": "default-editor",
+  "pod_labels": {
+    "h200-pod-default": "true",
+    "private-h200-acme-0-pod-default": "true"
+  },
+  "node_selector": {},
+  "volumes": [
+    {
+      "pvc": "alice-ws",
+      "mountPath": "/home/irteam"
+    }
+  ],
+  "excluded_volumes": [],
+  "root": "/home/irteam/gq",
+  "zone": "private-h200-acme-0",
+  "nodes": [
+    "h200-node-a",
+    "h200-node-d",
+    "h200-node-c",
+    "h200-node-b"
+  ],
+  "node_capacity": {
+    "gpu": 8,
+    "cpu": 125,
+    "mem": "1964Gi"
+  },
+  "cpu_job_default": {
+    "cpu": 8,
+    "mem": "64Gi"
+  },
+  "requests": {
+    "cpu": 1,
+    "mem": "4Gi"
+  },
+  "placement_grace": 60,
+  "deadline_slack": 1800,
+  "max_gpus_total": 4,
+  "max_running": 8,
+  "max_queue": 32,
+  "max_array": 64,
+  "max_time": 172800,
+  "max_wait_timeout": 86400,
+  "max_gpus_per_job": 8,
+  "job_ttl_after_finished": 3600,
+  "retention_days": 30,
+  "loop_interval": 2,
+  "metrics_interval": 30,
+  "gc_interval": 3600
+}

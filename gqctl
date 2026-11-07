@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""gqctl: set up and operate gq for one user ("instance").
+
+Run it where your own kubectl works (e.g. your laptop), never inside a notebook:
+after `gqctl lockdown` notebooks have no Kubernetes token on purpose.
+
+    gqctl init --notebook <your-notebook>      # writes gq.config.json from that notebook
+    gqctl probe [--gpu]                        # one-off Job: does a plain Job run here?
+    gqctl install --notebook <running-nb>      # gq CLI + agent skill onto your PVC
+    gqctl up                                   # deploy / update gqd
+    gqctl status | logs | render | down
+    gqctl lockdown --prefix <your-prefix>-     # remove the token from your notebooks
+
+See README.md.
+"""
+import argparse
+import json
+import os
+import posixpath
+import re
+import shlex
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import gqd  # noqa: E402  (stdlib only at import time)
+
+CAP_KEYS = ("node_capacity", "cpu_job_default", "requests", "placement_grace", "deadline_slack",
+            "max_gpus_total", "max_running", "max_queue", "max_array", "max_time", "max_wait_timeout",
+            "max_gpus_per_job", "job_ttl_after_finished", "retention_days", "loop_interval",
+            "metrics_interval", "gc_interval")
+
+# MLXP (a multi-tenant Kubeflow platform) defaults: PodDefaults carry the zone in this
+# annotation, the Zone object lists its nodes, and the notebook form's maximum per pod is
+# the node size (H200 nodes: 8 GPUs, 125 cores, 1964Gi).
+MLXP_ZONE_ANNOTATION = "mlx.navercorp.com/zone"
+MLXP_ZONE_RESOURCE = "zones.management.mlx.navercorp.com"
+MLXP_NODE_CAPACITY = {"gpu": 8, "cpu": 125, "mem": "1964Gi"}
+
+
+class Fail(Exception):
+    pass
+
+
+def kubectl(*args, stdin=None, check=True):
+    r = subprocess.run(["kubectl"] + list(args), input=stdin, text=True, capture_output=True)
+    if check and r.returncode:
+        raise Fail("kubectl %s failed:\n%s" % (" ".join(args), (r.stderr or r.stdout).strip()))
+    return r.stdout
+
+
+def kjson(*args, check=True):
+    out = kubectl(*args, "-o", "json", check=check)
+    return json.loads(out) if out.strip() else None
+
+
+# ---------------------------------------------------------------- pure: discovery and rendering
+
+def shareable(vol, info):
+    """Can Job pods on other nodes mount this PVC while the notebook has it mounted?"""
+    modes = set(info.get("accessModes") or [])
+    return "ReadWriteMany" in modes or (vol.get("readOnly") and "ReadOnlyMany" in modes)
+
+
+def poddefault_labels(nb_labels, pod_defaults):
+    """Notebook labels that select PodDefaults (Kubeflow injects those into the notebook pod;
+    Job pods get the same labels so they get the same defaults), and the matched PodDefaults.
+    pod_defaults None (unreadable): fall back to MLXP's `<name>-pod-default: "true"` convention."""
+    if pod_defaults is None:
+        return {k: v for k, v in nb_labels.items() if k.endswith("-pod-default") and v == "true"}, []
+    labels, matched = {}, []
+    for pd in pod_defaults:
+        sel = ((pd.get("spec") or {}).get("selector") or {}).get("matchLabels") or {}
+        if sel and all(nb_labels.get(k) == v for k, v in sel.items()):
+            labels.update(sel)
+            matched.append(pd)
+    return labels, matched
+
+
+def mlxp_zone(matched_pod_defaults):
+    for pd in matched_pod_defaults:
+        zone = (pd["spec"].get("annotations") or {}).get(MLXP_ZONE_ANNOTATION)
+        if zone:
+            return zone
+    return None
+
+
+def node_capacity_of(nodes):
+    """node_capacity from Node objects' allocatable (the smallest node), or None."""
+    caps = []
+    for n in nodes:
+        a = (n.get("status") or {}).get("allocatable") or {}
+        if a.get("nvidia.com/gpu"):
+            caps.append({"gpu": int(a["nvidia.com/gpu"]), "cpu": gqd.parse_cpu(a.get("cpu", 0)),
+                         "mem": gqd.fmt_mem(gqd.parse_mem(a.get("memory", 0)) // 2**30 * 2**30)})
+    if not caps:
+        return None
+    small = min(caps, key=lambda c: (c["gpu"], c["cpu"]))
+    return {"gpu": small["gpu"], "cpu": int(small["cpu"]), "mem": small["mem"]}
+
+
+def discover(nb, pod_defaults, nodes=None, instance=None, pvc_info=None, node_capacity=None, node_selector=None):
+    """Build an instance config from one of the user's Notebook objects.
+
+    Copies the notebook's PVC mounts that pods on other nodes can share (ReadWriteMany;
+    ReadOnlyMany for read-only mounts) so Job pods see the same paths; RWO and node-local
+    volumes are listed under excluded_volumes. Takes the labels that select the notebook's
+    PodDefaults, the image and the service account. On MLXP the matched PodDefaults name the
+    zone. pvc_info: claim name -> PVC spec (accessModes, storageClassName), or None if PVCs
+    could not be read. nodes empty = scheduler-placement mode. Returns (config, warnings)."""
+    meta, spec = nb["metadata"], nb["spec"]["template"]["spec"]
+    c = spec["containers"][0]
+    pvcs = {v["name"]: v["persistentVolumeClaim"]["claimName"]
+            for v in spec.get("volumes") or [] if v.get("persistentVolumeClaim")}
+    mounted = []
+    for m in c.get("volumeMounts") or []:
+        if m["name"] in pvcs:
+            v = {"pvc": pvcs[m["name"]], "mountPath": m["mountPath"]}
+            for k in ("subPath", "readOnly"):
+                if m.get(k):
+                    v[k] = m[k]
+            mounted.append(v)
+    if not mounted:
+        raise Fail("notebook %s mounts no PVC; gq needs a shared volume" % meta["name"])
+    warnings = []
+    if pvc_info is None:
+        volumes, excluded = mounted, []
+        warnings.append("could not read PVC access modes; assuming every volume is ReadWriteMany. "
+                        "Remove volumes Job pods cannot mount (ReadWriteOnce, local-path) by hand")
+    else:
+        volumes, excluded = [], []
+        for v in mounted:
+            info = pvc_info.get(v["pvc"]) or {}
+            if shareable(v, info):
+                volumes.append(v)
+            else:
+                excluded.append(dict(v, accessModes=info.get("accessModes") or ["unknown"],
+                                     storageClass=info.get("storageClassName")))
+                warnings.append("%s (%s, %s) is left out: Job pods on other nodes cannot mount it, so files "
+                                "under %s are not visible to jobs and gq refuses to run there"
+                                % (v["pvc"], ",".join(info.get("accessModes") or ["unknown"]),
+                                   info.get("storageClassName"), v["mountPath"]))
+    if not [v for v in volumes if not v.get("readOnly")]:
+        raise Fail("notebook %s has no writable ReadWriteMany PVC; gq needs one for its files and for "
+                   "Job pods to see your work (create an RWX volume and mount it in the notebook)" % meta["name"])
+    homes = [v for v in volumes if re.fullmatch(r"/home/[^/]+/?", v["mountPath"]) and not v.get("readOnly")]
+    base = homes[0] if homes else min((v for v in volumes if not v.get("readOnly")),
+                                      key=lambda v: len(v["mountPath"]), default=None)
+    if base is None:
+        raise Fail("all PVC mounts are read-only; gq needs a writable one")
+    if not homes:
+        warnings.append("no shareable PVC is mounted at a home directory; gq root is %s/gq, so set "
+                        "GQ_ROOT in your shell (gqctl install prints the line)" % base["mountPath"].rstrip("/"))
+    labels, matched = poddefault_labels(meta.get("labels") or {}, pod_defaults)
+    if pod_defaults is None:
+        warnings.append("could not read PodDefaults; copied the notebook's *-pod-default labels (MLXP style). "
+                        "Check pod_labels")
+    zone = mlxp_zone(matched)
+    platform = "mlxp" if zone else "kubeflow"
+    inst = instance or re.sub(r"[^a-z0-9-]", "", meta["name"].split("-")[0].lower())[:16].strip("-") or "me"
+    cfg = {
+        "instance": inst,
+        "platform": platform,
+        "namespace": meta["namespace"],
+        "image": c["image"],
+        "service_account": spec.get("serviceAccountName") or "default-editor",
+        "pod_labels": labels,
+        "node_selector": dict(node_selector or {}),
+        "volumes": volumes,
+        "excluded_volumes": excluded,
+        "root": base["mountPath"].rstrip("/") + "/gq",
+        "zone": zone,
+        "nodes": list(nodes or []),
+    }
+    cfg.update({k: gqd.DEFAULTS[k] for k in CAP_KEYS})
+    if node_capacity:
+        cfg["node_capacity"] = node_capacity
+    elif platform == "mlxp":
+        cfg["node_capacity"] = dict(MLXP_NODE_CAPACITY)
+        warnings.append("node_capacity set to %s, the MLXP H200 node size; change it if your zone's nodes differ"
+                        % json.dumps(MLXP_NODE_CAPACITY))
+    else:
+        warnings.append("node_capacity is the default %s; set it to your GPU nodes' size (it also sets the "
+                        "default CPU/memory limit per GPU)" % json.dumps(cfg["node_capacity"]))
+    if not cfg["nodes"]:
+        warnings.append("no node list (pass --nodes, or --node-selector if you may list nodes): scheduler-placement "
+                        "mode, so gq cannot show free GPUs per node or avoid fragmentation, but jobs still run")
+    return cfg, warnings
+
+
+def names(cfg):
+    return {"deploy": "gqd-" + cfg["instance"], "configmap": "gqd-" + cfg["instance"]}
+
+
+def root_volume(cfg):
+    v = gqd.mount_of(cfg["root"], cfg)
+    rel = posixpath.relpath(posixpath.normpath(cfg["root"]), posixpath.normpath(v["mountPath"]))
+    return v, posixpath.join(v.get("subPath") or "", rel)
+
+
+def render_deployment(cfg):
+    n, inst = names(cfg), cfg["instance"]
+    vol, sub = root_volume(cfg)
+    labels = {"app": n["deploy"], "gq-instance": inst}
+    return {
+        "apiVersion": "apps/v1", "kind": "Deployment",
+        "metadata": {"name": n["deploy"], "namespace": cfg["namespace"], "labels": labels},
+        "spec": {
+            "replicas": 1,
+            "strategy": {"type": "Recreate"},  # never two gqd for one instance
+            "selector": {"matchLabels": labels},
+            "template": {
+                "metadata": {"labels": dict(labels, **cfg["pod_labels"])},
+                "spec": {
+                    "serviceAccountName": cfg.get("service_account", "default-editor"),  # the only token holder
+                    "containers": [{
+                        "name": "gqd",
+                        "image": cfg.get("gqd_image") or cfg["image"],
+                        "command": ["python3", "-I", "/opt/gqd/gqd.py", "--config", "/opt/gqd/config.json",
+                                    "--root", "/gq"],
+                        "env": [{"name": "PYTHONUNBUFFERED", "value": "1"}],
+                        "resources": {"requests": {"cpu": "100m", "memory": "256Mi"},
+                                      "limits": {"cpu": "1", "memory": "1Gi"}},
+                        "volumeMounts": [{"name": "root", "mountPath": "/gq", "subPath": sub},  # only <root>
+                                         {"name": "code", "mountPath": "/opt/gqd", "readOnly": True}],
+                    }],
+                    "volumes": [{"name": "root", "persistentVolumeClaim": {"claimName": vol["pvc"]}},
+                                {"name": "code", "configMap": {"name": n["configmap"]}}],
+                },
+            },
+        },
+    }
+
+
+def render_probe(cfg, gpu=False):
+    v, _ = root_volume(cfg)
+    script = ("id; test -w %s && echo PVC_WRITABLE || echo PVC_NOT_WRITABLE; "
+              "ls /var/run/secrets/kubernetes.io >/dev/null 2>&1 && echo TOKEN_PRESENT || echo NO_TOKEN; "
+              "python3 -c 'import kubernetes' 2>/dev/null && echo K8S_CLIENT_OK || echo NO_K8S_CLIENT; "
+              "%secho GQ_PROBE_OK" % (shlex.quote(v["mountPath"]), "nvidia-smi -L && " if gpu else ""))
+    limits = {"cpu": "1", "memory": "1Gi"}
+    if gpu:
+        limits["nvidia.com/gpu"] = "1"
+    mounts = [dict({"name": "v%d" % i, "mountPath": x["mountPath"]},
+                   **{k: x[k] for k in ("subPath", "readOnly") if x.get(k)}) for i, x in enumerate(cfg["volumes"])]
+    labels = {"gq-probe": cfg["instance"]}
+    return {
+        "apiVersion": "batch/v1", "kind": "Job",
+        "metadata": {"generateName": "gq-%s-probe-" % cfg["instance"], "namespace": cfg["namespace"],
+                     "labels": labels},
+        "spec": {
+            "backoffLimit": 0, "activeDeadlineSeconds": 900, "ttlSecondsAfterFinished": 600,
+            "template": {
+                "metadata": {"labels": dict(labels, **cfg["pod_labels"])},
+                "spec": {
+                    "restartPolicy": "Never", "automountServiceAccountToken": False,
+                    "containers": [{"name": "main", "image": cfg["image"], "command": ["bash", "-lc", script],
+                                    "resources": {"requests": {"cpu": "1", "memory": "1Gi"}, "limits": limits},
+                                    "volumeMounts": mounts}],
+                    "volumes": [{"name": "v%d" % i, "persistentVolumeClaim": {"claimName": x["pvc"]}}
+                                for i, x in enumerate(cfg["volumes"])],
+                },
+            },
+        },
+    }
+
+
+# ---------------------------------------------------------------- commands
+
+def load(path):
+    if not os.path.exists(path):
+        raise Fail("%s not found; run `gqctl init --notebook <your-notebook>` first" % path)
+    cfg = gqd.load_config(path)
+    return {k: v for k, v in cfg.items() if not k.startswith("_")}
+
+
+def cmd_init(a):
+    if os.path.exists(a.config) and not a.force:
+        raise Fail("%s exists; use --force to overwrite" % a.config)
+    ns = ["-n", a.namespace] if a.namespace else []
+    nb = kjson("get", "notebook", a.notebook, *ns)
+    nbns = nb["metadata"]["namespace"]
+    pd_list = kjson("get", "poddefaults", "-n", nbns, check=False)
+    pds = pd_list["items"] if pd_list else None
+    pvc_list = kjson("get", "pvc", "-n", nbns, check=False)
+    pvc_info = {p["metadata"]["name"]: p.get("spec") or {} for p in pvc_list["items"]} if pvc_list else None
+    selector = dict(kv.split("=", 1) for kv in a.node_selector or [])
+    _, matched = poddefault_labels(nb["metadata"].get("labels") or {}, pds)
+    zone = mlxp_zone(matched)
+
+    # Node list: --nodes, else the MLXP Zone, else the nodes matching --node-selector (needs
+    # permission to list nodes). None of these: scheduler-placement mode.
+    nodes, node_objs = [n for n in (a.nodes or "").split(",") if n], []
+    if not nodes and zone:
+        z = kjson("get", MLXP_ZONE_RESOURCE, zone, check=False)
+        nodes = ((z or {}).get("spec") or {}).get("nodes") or []
+    if not nodes and selector:
+        lst = kjson("get", "nodes", "-l", ",".join("%s=%s" % kv for kv in selector.items()), check=False)
+        node_objs = (lst or {}).get("items") or []
+        nodes = [n["metadata"]["name"] for n in node_objs]
+    if nodes and not node_objs:
+        node_objs = ((kjson("get", "nodes", *nodes, check=False) or {}).get("items") or []) if len(nodes) > 1 else \
+            [x for x in [kjson("get", "node", nodes[0], check=False)] if x]
+    capacity = None
+    if a.node_capacity:
+        g, cpu, mem = a.node_capacity.split(",")
+        capacity = {"gpu": int(g), "cpu": float(cpu), "mem": mem}
+    else:
+        capacity = node_capacity_of(node_objs)
+    cfg, warnings = discover(nb, pds, nodes=nodes, instance=a.instance, pvc_info=pvc_info,
+                             node_capacity=capacity, node_selector=selector)
+    with open(a.config, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    print("wrote %s for instance %r (namespace %s, platform %s)"
+          % (a.config, cfg["instance"], cfg["namespace"], cfg["platform"]))
+    print("  image    %s\n  root     %s\n  volumes  %s\n  excluded %s\n  labels   %s\n  zone     %s\n  nodes    %s"
+          "\n  capacity %s per node"
+          % (cfg["image"], cfg["root"], ", ".join("%s@%s" % (v["pvc"], v["mountPath"]) for v in cfg["volumes"]),
+             ", ".join("%s@%s" % (v["pvc"], v["mountPath"]) for v in cfg["excluded_volumes"]) or "-",
+             ", ".join("%s=%s" % kv for kv in cfg["pod_labels"].items()) or "-",
+             cfg["zone"] or "-", ", ".join(cfg["nodes"]) or "- (scheduler-placement mode)",
+             json.dumps(cfg["node_capacity"])))
+    for w in warnings:
+        print("  ! " + w)
+    print("review the file (limits: max_gpus_total, max_running, ...), then: gqctl probe")
+    return 0
+
+
+def cmd_render(a):
+    cfg = load(a.config)
+    print(json.dumps({"apiVersion": "v1", "kind": "List",
+                      "items": [render_deployment(cfg), render_probe(cfg, a.gpu)]}, indent=2))
+    return 0
+
+
+def cmd_probe(a):
+    cfg = load(a.config)
+    name = kubectl("create", "-f", "-", "-o", "name", stdin=json.dumps(render_probe(cfg, a.gpu))).strip()
+    print("created %s; waiting up to 10 minutes ..." % name)
+    r = subprocess.run(["kubectl", "wait", "-n", cfg["namespace"], name, "--for=condition=complete",
+                        "--timeout=600s"], capture_output=True, text=True)
+    out = kubectl("logs", "-n", cfg["namespace"], name, "-c", "main", check=False)
+    print(out.rstrip())
+    checks = {"GQ_PROBE_OK": "Job ran to the end", "PVC_WRITABLE": "PVC is writable as the image user",
+              "NO_TOKEN": "pod has no Kubernetes token"}
+    ok = r.returncode == 0 and all(k in out for k in checks)
+    for k, what in checks.items():
+        print("  %s %s" % ("ok " if k in out else "BAD", what))
+    if r.returncode:
+        print("  BAD Job did not complete: %s" % (r.stderr.strip() or r.stdout.strip()))
+        print("      inspect: kubectl describe -n %s %s" % (cfg["namespace"], name))
+    if "NO_K8S_CLIENT" in out and not cfg.get("gqd_image"):
+        print("  !   the image has no `kubernetes` Python package; gqd needs it. Set \"gqd_image\" in %s "
+              "to an image with python3 + kubernetes" % a.config)
+        ok = False
+    print("probe %s" % ("passed" if ok else "FAILED"))
+    return 0 if ok else 1
+
+
+def cmd_install(a):
+    cfg = load(a.config)
+    ns, pod, ctr = cfg["namespace"], a.pod or a.notebook + "-0", a.container or a.notebook
+    rootd = cfg["root"]
+    # The skill only has to persist in the notebook (agents read it there), so it goes under the
+    # notebook user's own $HOME, which need not be shareable with Job pods.
+    home = kubectl("exec", "-n", ns, pod, "-c", ctr, "--", "sh", "-c", 'printf %s "$HOME"').strip() or "/root"
+    skills = posixpath.join(a.skills_dir or posixpath.join(home, ".claude"), "skills", "gq")
+    kubectl("exec", "-n", ns, pod, "-c", ctr, "--", "mkdir", "-p",
+            rootd + "/bin", rootd + "/spool", rootd + "/jobs", skills)
+    kubectl("cp", os.path.join(HERE, "gq"), "%s/%s:%s/bin/gq" % (ns, pod, rootd), "-c", ctr)
+    kubectl("cp", os.path.join(HERE, "skill", "SKILL.md"), "%s/%s:%s/SKILL.md" % (ns, pod, skills), "-c", ctr)
+    kubectl("exec", "-n", ns, pod, "-c", ctr, "--", "chmod", "755", rootd + "/bin/gq")
+    print("installed gq to %s/bin and the agent skill to %s" % (rootd, skills))
+    print("add to your shell rc in the notebook:\n  export GQ_ROOT=%s\n  export PATH=\"$GQ_ROOT/bin:$PATH\"" % rootd)
+    return 0
+
+
+def cmd_up(a):
+    cfg = load(a.config)
+    n, ns = names(cfg), cfg["namespace"]
+    cm = kubectl("create", "configmap", n["configmap"], "-n", ns, "--from-file=gqd.py=" + os.path.join(HERE, "gqd.py"),
+                 "--from-file=config.json=" + a.config, "--dry-run=client", "-o", "yaml")
+    kubectl("apply", "-f", "-", stdin=cm)
+    kubectl("apply", "-f", "-", stdin=json.dumps(render_deployment(cfg)))
+    kubectl("rollout", "restart", "-n", ns, "deploy/" + n["deploy"])
+    print(kubectl("rollout", "status", "-n", ns, "deploy/" + n["deploy"], "--timeout=300s").strip())
+    print(kubectl("logs", "-n", ns, "deploy/" + n["deploy"], "-c", "gqd", "--tail=5", check=False).rstrip())
+    return 0
+
+
+def cmd_status(a):
+    cfg = load(a.config)
+    n, ns = names(cfg), cfg["namespace"]
+    print(kubectl("get", "deploy,pods", "-n", ns, "-l", "gq-instance=" + cfg["instance"], check=False).rstrip())
+    print(kubectl("get", "jobs", "-n", ns, "-l", "gq-instance=" + cfg["instance"], check=False).rstrip()
+          or "(no gq jobs)")
+    print(kubectl("logs", "-n", ns, "deploy/" + n["deploy"], "-c", "gqd", "--tail=10", check=False).rstrip())
+    return 0
+
+
+def cmd_logs(a):
+    cfg = load(a.config)
+    return subprocess.call(["kubectl", "logs", "-n", cfg["namespace"], "deploy/" + names(cfg)["deploy"],
+                            "-c", "gqd", "--tail=100"] + (["-f"] if a.follow else []))
+
+
+def cmd_lockdown(a):
+    cfg = load(a.config)
+    ns = cfg["namespace"]
+    nbs = list(a.notebook or [])
+    if a.prefix:
+        listed = kjson("get", "notebooks", "-n", ns)["items"]
+        nbs += [x["metadata"]["name"] for x in listed if x["metadata"]["name"].startswith(a.prefix)]
+    nbs = sorted(set(nbs))
+    if not nbs:
+        raise Fail("no notebooks selected (use --notebook NAME or --prefix PREFIX)")
+    print("will set automountServiceAccountToken=false on: %s" % ", ".join(nbs))
+    print("running notebooks RESTART (tmux sessions, processes and --local gq jobs are lost).")
+    if not a.yes and input("continue? [y/N] ").strip().lower() != "y":
+        print("aborted")
+        return 1
+    patch = json.dumps({"spec": {"template": {"spec": {"automountServiceAccountToken": False}}}})
+    for nb in nbs:
+        kubectl("patch", "notebook", nb, "-n", ns, "--type", "merge", "-p", patch)
+        print("patched %s" % nb)
+    print("verify once a notebook is running again (expect 'No such file or directory'):")
+    print("  kubectl exec -n %s <notebook>-0 -c <notebook> -- ls /var/run/secrets/kubernetes.io/serviceaccount" % ns)
+    return 0
+
+
+def cmd_down(a):
+    cfg = load(a.config)
+    n, ns = names(cfg), cfg["namespace"]
+    kubectl("delete", "-n", ns, "deploy/" + n["deploy"], "configmap/" + n["configmap"], "--ignore-not-found")
+    print("deleted gqd for instance %s" % cfg["instance"])
+    if a.jobs:
+        print(kubectl("delete", "jobs", "-n", ns, "-l", "gq-instance=" + cfg["instance"]).rstrip())
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="gqctl", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--config", default="gq.config.json", help="instance config (default ./gq.config.json)")
+    sub = ap.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("init", help="write the config from one of your notebooks")
+    p.add_argument("--notebook", required=True)
+    p.add_argument("--namespace", "-n")
+    p.add_argument("--instance", help="short name used in resource names (default: notebook name prefix)")
+    p.add_argument("--nodes", help="comma-separated GPU nodes gq may place on (default: MLXP zone nodes, "
+                                   "or nodes matching --node-selector)")
+    p.add_argument("--node-selector", action="append", metavar="KEY=VALUE",
+                   help="label of your GPU nodes; added to Job pods and used to list nodes if you may")
+    p.add_argument("--node-capacity", metavar="GPU,CPU,MEM",
+                   help="size of one node, e.g. 8,125,1964Gi (default: read from nodes, or MLXP H200 size)")
+    p.add_argument("--force", action="store_true")
+    p = sub.add_parser("render", help="print the Deployment and probe Job as JSON")
+    p.add_argument("--gpu", action="store_true")
+    p = sub.add_parser("probe", help="run a one-off Job to check this setup works")
+    p.add_argument("--gpu", action="store_true", help="also request one GPU and run nvidia-smi")
+    p = sub.add_parser("install", help="copy the gq CLI and agent skill onto your PVC via a running notebook")
+    p.add_argument("--notebook", required=True)
+    p.add_argument("--pod", help="default <notebook>-0")
+    p.add_argument("--container", help="default <notebook>")
+    p.add_argument("--skills-dir", help="Claude Code config dir in the notebook (default $HOME/.claude there)")
+    sub.add_parser("up", help="deploy or update gqd")
+    sub.add_parser("status", help="gqd pod, gq Jobs and recent logs")
+    p = sub.add_parser("logs", help="gqd logs")
+    p.add_argument("-f", "--follow", action="store_true")
+    p = sub.add_parser("lockdown", help="remove the Kubernetes token from your notebooks")
+    p.add_argument("--notebook", action="append")
+    p.add_argument("--prefix")
+    p.add_argument("--yes", action="store_true")
+    p = sub.add_parser("down", help="remove gqd")
+    p.add_argument("--jobs", action="store_true", help="also delete this instance's Jobs")
+    a = ap.parse_args(argv)
+    try:
+        return {"init": cmd_init, "render": cmd_render, "probe": cmd_probe, "install": cmd_install, "up": cmd_up,
+                "status": cmd_status, "logs": cmd_logs, "lockdown": cmd_lockdown, "down": cmd_down}[a.command](a)
+    except (Fail, ValueError) as e:
+        print("gqctl: error: %s" % e, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
