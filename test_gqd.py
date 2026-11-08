@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import sys
+import subprocess
 import tempfile
 import time
 
@@ -305,7 +306,8 @@ class FakeKube:
         self.pods[:] = [p for p in self.pods if gqd.pod_job_name(p) != name]
         self.deleted.append(name)
 
-    def run(self, name, node, started="2026-11-08T06:00:05Z"):
+    def run(self, name, node, started=None):
+        started = started or dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # "now": --time is live
         self.pods[:] = [p for p in self.pods if gqd.pod_job_name(p) != name]
         p = kpod(name, node, containerStatuses=[{"name": "main", "state": {"running": {"startedAt": started}}}])
         p["spec"]["containers"][0]["resources"] = self.jobs[name]["spec"]["template"]["spec"]["containers"][0]["resources"]
@@ -688,6 +690,34 @@ def test_gqctl_notebook_side_scripts():
         for n, claims in (("alice-cpu", ["alice-ws"]), ("alice-gpu", ["alice-ws", "alice-data"]),
                           ("bob-gpu", ["bob-ws"]), ("alice-tmp", []))]
     assert gqctl.notebooks_using(nbs, ["alice-ws"]) == ["alice-cpu", "alice-gpu"]
+    # unlock targets only the locked ones
+    nbs[1]["spec"]["template"]["spec"]["automountServiceAccountToken"] = False
+    assert gqctl.locked(nbs) == ["alice-gpu"]
+
+
+def test_completion():
+    """Generated bash completion: subcommands, per-subcommand options, job ids, value options."""
+    tmp = tempfile.mkdtemp()
+    try:
+        os.makedirs(os.path.join(tmp, "jobs", "251108-101010-ab12"))
+        script = os.path.join(tmp, "c.bash")
+        open(script, "w").write(gqctl.completion_script())
+
+        def comp(*words):
+            sh = ('source %s; COMP_WORDS=(%s); COMP_CWORD=%d; _%s_complete; echo "${COMPREPLY[*]}"'
+                  % (script, " ".join("'%s'" % w for w in words), len(words) - 1, words[0]))
+            return subprocess.run(["bash", "-c", sh], capture_output=True, text=True, check=True,
+                                  env=dict(os.environ, GQ_ROOT=tmp)).stdout.split()
+        assert {"run", "capacity", "--help"} <= set(comp("gq", "")) and "unlock" not in comp("gq", "")
+        assert comp("gq", "st") == ["status"]
+        assert "251108-101010-ab12" in comp("gq", "logs", "")
+        assert comp("gq", "run", "--t") == ["--time"]
+        assert comp("gq", "run", "--time", "") == []          # value: default completion
+        assert comp("gq", "run", "--time", "1h", "--", "py") == []
+        assert comp("gqctl", "--config", "x.json", "un") == ["unlock"]
+        assert comp("gqctl", "bogus", "") == []
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_local_backend():

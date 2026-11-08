@@ -183,11 +183,17 @@ RWX 볼륨이 하나도 없으면 `init`이 설정을 만들지 않고 이유를
 ```
 
 함께 하는 일:
-- **환경 파일:** `<root>/env.sh`(`GQ_ROOT`, `PATH`)를 쓴다.
+- **환경 파일:** `<root>/env.sh`(`GQ_ROOT`, `PATH`)와 탭 자동완성 `<root>/completion.bash`를 쓴다. env.sh가 대화형 셸(bash, zsh)에서 자동완성을 읽어서, `gq <TAB>`으로 서브커맨드와 옵션이, `gq logs <TAB>`으로 작업 ID가 완성된다.
 - **셸 rc:** `~/.bashrc`(있으면 `~/.zshrc`도)에 `. <root>/env.sh` 한 줄을 표식 주석과 함께 넣는다. 여러 번 실행해도 한 번만 들어간다.
   - rc 파일이 symlink면(다른 곳에서 관리하는 경우) 건드리지 않고 넣을 줄만 알려준다.
   - `--no-shell-rc`로 끄고, `--shell-rc FILE`로 넣을 파일을 바꾼다.
 - **Claude Code 설정:** `~/.claude/settings.json`에 `allow: Bash(gq *)`, `deny: Bash(kubectl *)`를 합친다. 처음 한 번 `settings.json.before-gq`로 백업하고, `--no-claude-settings`로 끈다.
+
+**gqctl 자동완성 (노트북 PC):** `gqctl`도 탭 자동완성을 쓰려면 `~/.zshrc`(또는 `~/.bashrc`)에 다음 한 줄을 넣는다. 자동완성은 argparse 정의에서 생성되므로 옵션이 바뀌어도 따로 고칠 것이 없다.
+
+```bash
+eval "$(/path/to/kubeflow-gq/gqctl completion)"
+```
 
 끝나면 노트북에서 새 터미널을 열거나 `source ~/.bashrc`를 실행한다. 볼륨이 공유되므로, 같은 볼륨을 마운트하는 내 다른 노트북에서도 같은 `gq`를 쓸 수 있다.
 
@@ -234,6 +240,8 @@ Kubeflow 노트북 pod에는 보통 네임스페이스 편집 권한을 가진 �
 - **MLXP의 KFP 토큰:** MLXP 노트북에는 KFP 토큰(`/var/run/secrets/kubeflow/pipelines`)이 웹훅으로 따로 들어갈 수 있다. 남아 있다면 DESIGN.md 12장의 열린 질문을 본다.
 - **설정 초기화:** MLXP UI에서 노트북 설정을 수정하면 이 값이 초기화될 수 있다. 수정한 뒤에는 위 확인을 다시 한다.
 - **kubectl 위치:** 이후 kubectl 작업과 `gqctl` 실행은 노트북 PC에서만 한다.
+
+**되돌리기:** `./gqctl unlock`은 lockdown을 되돌린다. 공유 볼륨을 마운트하는 노트북 중 lockdown된 것의 `automountServiceAccountToken` 필드를 지워 플랫폼 기본값(보통 토큰 마운트)으로 돌려놓는다. lockdown과 마찬가지로 실행 중인 노트북은 재시작되고, 옵션(`--notebook`, `--prefix`, `--yes`, `--no-wait`)도 같다.
 
 ### 7. 에이전트 설정 (Claude Code, 노트북 안)
 
