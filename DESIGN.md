@@ -701,3 +701,53 @@ GPU 노트북을 직접 켜서 쓰는 기존 방식은 그대로 쓸 수 있다.
 | 노드 크기 | `--node-capacity`가 있으면 그것을 쓰고, 없으면 조회한 노드의 allocatable(GPU 노드 중 가장 작은 것)을 쓴다. 그것도 없으면 MLXP H200 기본값을 쓰거나, 기본값임을 경고한다 |
 | scheduler 배치 모드 | `nodes`가 비면 gqd는 노드별 여유 계산과 고정(affinity)을 하지 않는다. gq 상한(`max_gpus_total`, `max_running`)만 지키고 노드는 스케줄러가 고른다. GPU 범위(`LO-HI`)는 상한 안에서 최대를 받는다. Pending이 길어도 재배치하지 않고 `wait_timeout`까지 기다린다(고정한 노드가 없으므로). `gq capacity`는 노드별 정보가 없다고 알려주고, `--fit`은 판단할 수 없어 1을 돌려준다 |
 | `node_selector` | 선택 설정. Job pod의 nodeSelector로 들어간다. GPU 노드 풀 라벨 등에 쓴다 |
+
+## 15. pod 이어 받기와 `--after`
+
+목표: GPU를 받은 pod에서 작업이 끝났을 때, **곧바로 들어온 같은 모양의 작업이 그 pod를 이어 받아** 다시 줄을 서지 않게 한다. 에이전트는 pod를 고르지 않는다. 어디서 돌릴지는 gqd가 정한다.
+
+합의한 원칙(2026-11-08):
+- 유휴 대기는 짧은 유예만 둔다. 붐비면 기다리는 게 맞고, 유예는 보장이 아니라 덤이다.
+- 정책(최대 수명, 양보 규칙)은 넣지 않는다. 원래도 GPU 노트북으로 오래 쥘 수 있었고, 이어 받기는 대기열이 비면 바로 반납하므로 그보다 낫다. 대신 쥐고 있는 것을 보이게 한다.
+- 성공/실패에 따른 조건부 실행은 넣지 않는다. 분기는 결과를 본 에이전트나 사람이 정한다. `--after`는 순서만 건다.
+- 동시 실행(가벼운 작업끼리 같은 GPU)은 2단계다. 이 절은 직렬 이어 받기만 다룬다.
+
+### 15.1 worker
+
+Job 컨테이너의 명령은 gqd가 만든 bash worker다(코드는 ConfigMap의 gqd가 만든 문자열이고 PVC에서 오지 않는다).
+
+1. 작업 디렉터리에 `started`(UTC 시각)를 쓰고 `run.sh`를 실행해 `log`, `exit`를 쓴다(지금과 같음).
+2. `reuse_grace`가 0이면 바로 종료한다(이전 동작과 완전히 같음).
+3. 아니면 최대 `reuse_grace`초 동안 방금 끝난 작업 디렉터리의 `next` 파일을 기다린다. 형식은 한 줄 `<id> [<task_index> <task_count>]`이고, worker는 id를 정규식으로 검사한 뒤 그 작업을 같은 방식으로 실행한다.
+4. 시간이 다 되면 `next`를 **배타적으로 생성**(`set -C`, O_EXCL)해서 닫고 종료한다. gqd도 `next`를 O_EXCL로 만든다. 둘 중 먼저 만든 쪽이 이긴다. gqd가 이기면 worker는 그 작업을 실행하고, worker가 이기면 gqd는 배정을 취소해 작업을 대기열에 둔다.
+5. 종료 코드는 마지막 작업의 코드다.
+
+`next`는 PVC에 있으니 노트북의 에이전트도 쓸 수 있다. 그래도 경계는 그대로다. worker pod에는 토큰이 없고, 에이전트는 원래 gq로 임의 명령을 낼 수 있다.
+
+### 15.2 gqd
+
+| 항목 | 결정 |
+|---|---|
+| 유휴 pod | 작업이 끝났는데(`exit` 있음) 컨테이너가 아직 도는 GPU pod. gqd가 메모리에 `{job, node, gpus, cpu, mem, since}`로 기억한다. kill이나 시간 초과로 끝난 작업은 Job을 지우므로 유휴 pod가 되지 않는다. gqd가 재시작하면 잊고, 그 pod는 유예가 끝나면 스스로 종료한다 |
+| 이어 받기 조건 | 요청 GPU 범위에 pod의 GPU 수가 들어가고, 요청의 CPU/메모리 limit이 pod 이하일 때. GPU를 덜 쓰는 작업은 이어 받지 않는다(남는 GPU가 논다). CPU 작업 pod는 이어 받지 않는다 |
+| 순서 | 배치(`place`)에서 상한 검사 다음, 노드 배치보다 먼저 유휴 pod를 본다. FIFO와 backfill은 그대로다 |
+| 상한 | 유휴 pod도 `max_running`, `max_gpus_total`에 센다. 이어 받으면 늘지 않는다 |
+| 내 작업을 막지 않기 | 대기열에 Cap/NoFit인 작업이 있으면 배정받지 못한 유휴 pod는 바로 지운다. 유휴 pod가 내 다음 작업의 자리를 막는 일은 없다 |
+| 마감 연장 | 이어 받을 때 Job의 `activeDeadlineSeconds`를 `경과 + time + reuse_grace + deadline_slack`으로 늘린다. MLXP에서 실행 중 증가가 되는 것을 server dry-run으로 확인했다. 패치가 실패하면 이어 받지 않는다 |
+| 상태 | `exit`가 있으면 컨테이너가 돌고 있어도 끝난 것으로 본다. 시작 시각은 `started` 파일을 먼저 쓴다. 이어 받은 작업은 `started`가 생길 때까지 `pending`(reason `Handoff`)이다. 컨테이너 시작 시각으로 대신하지 않는다(이전 작업의 시각이라 바로 시간 초과가 된다) |
+| 기록 | 이어 받은 작업의 `job`은 원래 pod의 Job 이름이다. `reused: true`, `pod_since`(그 pod가 처음 배치된 시각)를 남긴다 |
+| 설정 | `reuse_grace` 기본 60초, 상한 300초. 상한을 넘으면 설정 오류다(조용히 줄이지 않음). 설정은 ConfigMap에만 있어 노트북의 에이전트는 바꿀 수 없다 |
+
+### 15.3 `--after`
+
+- `gq submit --after ID`(여러 번 가능). 배열 그룹 id는 모든 task로 펼친다. `--local`과는 같이 쓸 수 없다.
+- request의 `after`는 id 목록이다(최대 `max_array`개, 각각 ID 형식).
+- 앞 작업이 **모두 끝날 때까지**(종료 상태면 성공/실패 상관없음) 배치 대상이 아니다. 상태는 `queued`, reason `After`. 다른 작업의 FIFO를 막지 않는다.
+- `wait_timeout`은 앞 작업이 다 끝난 시각부터 센다.
+- 앞 작업이 없는 id면 거부한다(`Invalid`).
+- 앞 작업이 끝나는 루프에서 바로 배치되므로, 같은 모양이면 앞 작업의 pod를 이어 받는다.
+
+### 15.4 보이게 하기
+
+- `capacity.json`에 유휴 pod 목록(`idle_pods`: job, node, gpus, 유휴 시간)을 넣고 `gq ps` 머리줄에 개수를 보인다.
+- 이어 받은 작업은 `gq ps`의 REASON에 `reused pod (held 2h)`처럼 그 pod가 GPU를 쥔 시간을 보인다.

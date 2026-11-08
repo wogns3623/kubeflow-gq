@@ -290,6 +290,22 @@ gq kill <id>                                             # 중지 (배열 그룹
 | `--local` | | pod 대신 지금 이 노트북에서 실행한다 (CPU 작업 전용, gqd 불필요) |
 | `--env K=V` / `--clean-env` | | 환경변수 추가·덮어쓰기 / 환경 전달 끄기 |
 | `--cwd DIR` | 현재 디렉터리 | 작업 디렉터리 |
+| `--after ID` | | 그 작업이 **끝난 뒤에** 시작한다(성공/실패 상관없음). 여러 번 줄 수 있고, 배열 그룹 id는 모든 task로 펼친다. `--wait-timeout`은 앞 작업이 끝난 시각부터 센다 |
+
+### GPU pod 이어 받기
+
+GPU 작업이 끝나도 pod는 바로 사라지지 않고 **`reuse_grace`초(기본 60초)** 동안 기다린다. 그사이 **GPU 수가 같은** 작업이 대기열에 있으면, gqd가 그 작업을 이 pod에 넘겨 바로 이어서 돌린다. 다시 줄을 서지 않으므로, 붐빌 때 GPU를 놓치지 않는다.
+
+- **고를 것은 없다.** 평소처럼 `gq submit`만 하면 gqd가 이어 받을 pod가 있는지 본다. 결과를 보고 다음 작업을 1분 안에 내면 대개 이어 받는다.
+- **순서를 미리 걸어 두려면:** `--after`를 쓴다. 앞 작업이 끝나는 순간 배치되므로 같은 모양이면 그 pod를 이어 받는다.
+
+  ```bash
+  a=$(gq submit --gpus 1 --time 4h -- python train.py | jq -r .id)
+  gq submit --gpus 1 --time 1h --after "$a" -- python eval.py   # train이 실패해도 돈다. 분기는 eval.py가 판단
+  ```
+- **이어 받지 않는 경우:** GPU 수가 다르거나, 요청한 CPU/메모리 limit이 그 pod보다 크거나, kill이나 시간 초과로 끝났을 때.
+- **내 작업을 막지 않는다:** 대기열의 다른 작업이 상한(`Cap`)이나 자리(`NoFit`) 때문에 못 들어가면, 아무도 받지 않은 유휴 pod는 바로 반납한다.
+- **보기:** `gq ps` 머리줄에 기다리는 유휴 pod 수가, 이어 받은 작업의 REASON에 `reused pod (held 2h)`처럼 그 pod가 GPU를 쥔 시간이 나온다. 유휴 pod도 상한(`max_gpus_total`, `max_running`)에 센다.
 
 ### 단편화를 고려해 나누기
 
@@ -353,8 +369,8 @@ submitted → queued → pending → running → succeeded / failed
 | 상태 | 의미 |
 |---|---|
 | `submitted` | 요청 파일만 있다. gqd가 아직 읽지 않았다 |
-| `queued` | 기다리는 중. 사유는 `NoFit`(들어갈 노드 없음), `Cap`(내 gq 상한), `Replace`(재배치 중), `ApiError`(재시도 예정) |
-| `pending` | Job이 만들어졌고 pod가 시작되는 중이다 |
+| `queued` | 기다리는 중. 사유는 `NoFit`(들어갈 노드 없음), `Cap`(내 gq 상한), `After`(`--after`의 앞 작업을 기다림), `Replace`(재배치 중), `HandoffFailed`(이어 받을 pod가 먼저 끝나서 다시 배치), `ApiError`(재시도 예정) |
+| `pending` | Job이 만들어졌고 pod가 시작되는 중이다. `Handoff`면 끝난 작업의 pod를 이어 받는 중이다 |
 | `running` | 실행 중 |
 | `succeeded` / `failed` | exit 0 / 그 외. `failed`의 reason이 `OOMKilled`면 메모리 부족이다 |
 | `timeout` | `--time`을 넘겨서 중지됐다 |
@@ -385,6 +401,7 @@ submitted → queued → pending → running → succeeded / failed
 | `max_time` / `max_wait_timeout` | 48h / 24h | `--time` / `--wait-timeout`의 최대값 |
 | `max_array` | 64 | 배열 task 수 |
 | `requests` | 1코어 / 4Gi | 모든 Job의 request |
+| `reuse_grace` | 60 | 끝난 GPU pod가 이어 받을 작업을 기다리는 초. 0이면 끄고, 300을 넘으면 설정 오류다. 노트북의 에이전트는 바꿀 수 없다 |
 | `retention_days` | 30 | `<root>/jobs/<id>/`를 보관하는 기간 |
 
 설정을 바꾼 뒤에는 `./gqctl up`으로 반영한다.

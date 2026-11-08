@@ -16,6 +16,7 @@ import math
 import os
 import posixpath
 import re
+import shlex
 import shutil
 import stat
 import time
@@ -29,7 +30,8 @@ INSTANCE_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,14}[a-z0-9])?$")
 TERMINAL = frozenset({"rejected", "expired", "succeeded", "failed", "timeout", "lost", "killed"})
 ACTIVE = frozenset({"pending", "running"})
 REQ_KEYS = frozenset({"id", "group", "task_index", "task_count", "name", "owner", "backend",
-                      "gpus", "cpu", "mem", "time", "wait_timeout", "cwd", "submitted"})
+                      "gpus", "cpu", "mem", "time", "wait_timeout", "cwd", "submitted", "after"})
+REUSE_GRACE_MAX = 300  # hard ceiling for reuse_grace; a config above it is an error (DESIGN 15.2)
 MAX_REQ_BYTES = 64 * 1024
 
 REQUIRED = ("instance", "namespace", "image", "volumes", "root")
@@ -45,6 +47,8 @@ DEFAULTS = {
     "cpu_job_default": {"cpu": 8, "mem": "64Gi"},
     "requests": {"cpu": 1, "mem": "4Gi"},
     "placement_grace": 60,
+    # Seconds a finished GPU pod waits for a same-shape job to take it over (0 = exit at once).
+    "reuse_grace": 60,
     "deadline_slack": 1800,
     "max_gpus_total": 4,
     "max_running": 8,
@@ -222,6 +226,9 @@ def load_config(path=None, **overrides):
     cfg["_cpu_job"] = {"cpu": parse_cpu(d["cpu"]), "mem": parse_mem(d["mem"])}
     r = cfg["requests"]
     cfg["_req"] = {"cpu": parse_cpu(r["cpu"]), "mem": parse_mem(r["mem"])}
+    g = cfg["reuse_grace"]
+    if isinstance(g, bool) or not isinstance(g, int) or not 0 <= g <= REUSE_GRACE_MAX:
+        raise ValueError("reuse_grace must be an integer in [0, %d] seconds" % REUSE_GRACE_MAX)
     return cfg
 
 
@@ -321,6 +328,15 @@ def validate(req, cfg):
     except (TypeError, ValueError):
         raise Invalid("submitted: expected YYYY-MM-DDTHH:MM:SSZ")
     out["submitted"] = req["submitted"]
+
+    after = req.get("after")
+    if after is not None:
+        if not (isinstance(after, list) and 1 <= len(after) <= cfg["max_array"]
+                and all(isinstance(x, str) and ID_RE.match(x) for x in after)):
+            raise Invalid("after: expected 1-%d job ids" % cfg["max_array"])
+        if rid in after:
+            raise Invalid("after: a job cannot wait for itself")
+        out["after"] = sorted(set(after))
     return out
 
 
@@ -439,12 +455,25 @@ def capacity(pods, jobs, cfg, metrics=None):
     return {"nodes": out, "gpu_waiting": waiting}
 
 
-def place(queue, nodes, cfg, running, gq_gpus):
+def reusable(req, pod, cfg):
+    """Can req take over this idle pod? Same GPU count within its range, CPU/memory limits fit."""
+    lo, hi = req["gpus"]
+    if not lo <= pod["gpus"] <= hi:
+        return False
+    cpu, mem = resources(req, pod["gpus"], cfg)
+    return cpu <= pod["cpu"] and mem <= pod["mem"]
+
+
+def place(queue, nodes, cfg, running, gq_gpus, idle=()):
     """Decide which queued requests start now.
 
     queue: validated requests in FIFO order. nodes: capacity()["nodes"]. running / gq_gpus:
-    gq jobs and GPUs already active. Returns (decisions, nodes_after) where each decision
-    is (req, {"node", "gpus", "cpu", "mem"}) or (req, {"reason", "message"}).
+    gq jobs and GPUs already active, idle pods included. idle: finished GPU pods waiting to be
+    taken over ({"job", "node", "gpus", "cpu", "mem", ...}). Returns (decisions, nodes_after)
+    where each decision is (req, {"node", "gpus", "cpu", "mem"[, "reuse": idle pod]}) or
+    (req, {"reason", "message"}).
+
+    An idle pod is tried first: taking it over adds nothing to the caps or the nodes.
 
     FIFO with backfill: a later request may start when an earlier one does not fit.
     GPU jobs go to the fullest node that still fits (best fit); CPU jobs go to the node
@@ -457,9 +486,16 @@ def place(queue, nodes, cfg, running, gq_gpus):
     # traffic. If that happens, stop backfilling onto the node closest to fitting the
     # head-of-line job once it has waited N minutes.
     nodes = [dict(nd) for nd in nodes]
+    idle = list(idle)
     decisions = []
     for req in queue:
         lo, hi = req["gpus"]
+        pod = next((p for p in idle if reusable(req, p, cfg)), None)
+        if pod is not None:
+            idle.remove(pod)
+            decisions.append((req, {"node": pod["node"], "gpus": pod["gpus"], "cpu": pod["cpu"],
+                                    "mem": pod["mem"], "reuse": pod}))
+            continue
         if running >= cfg["max_running"]:
             decisions.append((req, {"reason": "Cap", "message": "gq already runs %d jobs (max_running %d)"
                                     % (running, cfg["max_running"])}))
@@ -504,6 +540,34 @@ def place(queue, nodes, cfg, running, gq_gpus):
     return decisions, nodes
 
 
+# The Job's command (DESIGN 15.1). Runs a job, then waits up to `grace` seconds for gqd to hand
+# it the next one in <job dir>/next ("<id> [<task_index> <task_count>]"). Giving up, it claims
+# `next` itself with an exclusive create, so it and gqd cannot both win. Exits with the last rc.
+WORKER = r"""set -f; root=%(root)s; grace=%(grace)d; id=$GQ_ID
+idre='^[0-9]{6}-[0-9]{6}-[0-9a-f]{4}(-[0-9]{1,3})?$'
+while :; do
+  d=$root/jobs/$id
+  date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ >"$d/started"
+  bash "$d/run.sh" >"$d/log" 2>&1; rc=$?
+  echo $rc >"$d/exit"
+  [ "$grace" -gt 0 ] || exit $rc
+  end=$((SECONDS + grace)); line=
+  while :; do
+    if [ -s "$d/next" ] || { [ $SECONDS -ge $end ] && ! (set -C; echo closed >"$d/next") 2>/dev/null; }; then
+      for _ in 1 2 3 4 5; do read -r line <"$d/next" && break; sleep 1; done
+      break
+    fi
+    [ $SECONDS -ge $end ] && exit $rc
+    sleep 1
+  done
+  set -- $line
+  [[ ${1:-} =~ $idre ]] || exit $rc
+  id=$1; export GQ_ID=$1
+  if [[ ${2:-} =~ ^[0-9]+$ && ${3:-} =~ ^[0-9]+$ ]]; then export GQ_TASK_INDEX=$2 GQ_TASK_COUNT=$3
+  else unset GQ_TASK_INDEX GQ_TASK_COUNT; fi
+done"""
+
+
 def build_job(req, node, gpus, cpu, mem, attempt, cfg):
     """The only Job shape gqd ever creates. Command and user env stay on the PVC (run.sh).
 
@@ -522,8 +586,7 @@ def build_job(req, node, gpus, cpu, mem, attempt, cfg):
     limits = {"cpu": fmt_cpu(cpu), "memory": fmt_mem(mem)}
     if gpus:
         limits[GPU] = str(gpus)
-    wrapper = ('d=%s/jobs/$GQ_ID; bash "$d/run.sh" >"$d/log" 2>&1; rc=$?; '
-               'echo $rc >"$d/exit"; exit $rc' % cfg["root"])
+    wrapper = WORKER % {"root": shlex.quote(cfg["root"]), "grace": cfg["reuse_grace"]}
     mounts, volumes = [], []
     for i, v in enumerate(cfg["volumes"]):
         m = {"name": "v%d" % i, "mountPath": v["mountPath"]}
@@ -542,7 +605,7 @@ def build_job(req, node, gpus, cpu, mem, attempt, cfg):
             "annotations": {"gq/name": req["name"], "gq/owner": req["owner"], "gq/node": node or "",
                             "gq/gpus": str(gpus), "gq/cpu": str(cpu), "gq/mem": str(mem),
                             "gq/cpu-request": str(rcpu), "gq/mem-request": str(rmem),
-                            "gq/attempt": str(attempt)},
+                            "gq/attempt": str(attempt), "gq/reuse-grace": str(cfg["reuse_grace"])},
         },
         "spec": {
             "backoffLimit": 0,
@@ -578,9 +641,16 @@ def build_job(req, node, gpus, cpu, mem, attempt, cfg):
     return job
 
 
-def derive_state(job, pod, exit_code):
+def main_running(pod):
+    cs = next((c for c in (pod or {}).get("status", {}).get("containerStatuses") or [] if c.get("name") == "main"), None)
+    return "running" in ((cs or {}).get("state") or {})
+
+
+def derive_state(job, pod, exit_code, started=None):
     """State of a placed pod job from what Kubernetes and the PVC show.
 
+    exit_code / started: the job's `exit` and `started` files. The exit file wins even while
+    the container still runs: the worker may be waiting to take over the next job (DESIGN 15).
     Returns a dict with state, reason, message, started, finished, exit_code, node.
     Kills and time limits are applied by the loop, not here."""
     def r(state, reason=None, message=None, started=None, finished=None, code=None, node=None):
@@ -597,15 +667,19 @@ def derive_state(job, pod, exit_code):
         status = pod.get("status") or {}
         cs = next((c for c in status.get("containerStatuses") or [] if c.get("name") == "main"), None)
         st = (cs or {}).get("state") or {}
+        if exit_code is not None and "running" in st:
+            return r("succeeded" if exit_code == 0 else "failed", None if exit_code == 0 else "Error",
+                     started=started or st["running"].get("startedAt"), code=exit_code, node=node)
         if "terminated" in st:
             t = st["terminated"]
             code = exit_code if exit_code is not None else t.get("exitCode")
             if code == 0:
-                return r("succeeded", started=t.get("startedAt"), finished=t.get("finishedAt"), code=0, node=node)
-            return r("failed", t.get("reason") or "Error", t.get("message"), t.get("startedAt"),
+                return r("succeeded", started=started or t.get("startedAt"), finished=t.get("finishedAt"), code=0,
+                         node=node)
+            return r("failed", t.get("reason") or "Error", t.get("message"), started or t.get("startedAt"),
                      t.get("finishedAt"), code, node)
         if "running" in st:
-            return r("running", started=st["running"].get("startedAt"), node=node)
+            return r("running", started=started or st["running"].get("startedAt"), node=node)
         if status.get("phase") == "Failed":  # evicted or killed before main ran
             if exit_code is not None:
                 return r("succeeded" if exit_code == 0 else "failed", code=exit_code, node=node)
@@ -672,6 +746,15 @@ class Kube:
             log.info("dry-run: Job %s accepted by the API server", body["metadata"]["name"])
         return True
 
+    def patch_job_deadline(self, name, seconds):
+        if not self.own_job.match(name):
+            raise ValueError("refusing to patch a Job this instance did not create: %r" % name)
+        if name in self._fake:
+            self._fake[name]["spec"]["activeDeadlineSeconds"] = seconds
+            return
+        self.batch.patch_namespaced_job(name, self.ns, {"spec": {"activeDeadlineSeconds": seconds}},
+                                        dry_run="All" if self.dry_run else None)
+
     def delete_job(self, name):
         if not self.own_job.match(name):
             raise ValueError("refusing to delete a Job this instance did not create: %r" % name)
@@ -696,6 +779,7 @@ class Daemon:
         self.tracked = {}   # id -> record (status.json content plus private "_" keys)
         self._written = {}  # id -> last status.json text
         self._metrics, self._metrics_at, self._gc_at = None, 0.0, 0.0
+        self.idle = {}      # job name -> finished GPU pod waiting for a takeover (DESIGN 15.2)
         self._recover()
 
     # -- files
@@ -711,6 +795,25 @@ class Daemon:
             return int(read_small(os.path.join(self._dir(rid), "exit"), 32).strip())
         except (OSError, ValueError, Invalid):
             return None
+
+    def _started(self, rid):
+        try:
+            text = read_small(os.path.join(self._dir(rid), "started"), 64).decode().strip()
+            return text if parse_ts(text) else None
+        except (OSError, ValueError, Invalid):
+            return None
+
+    def _done(self, rid):
+        """Has job rid ended (any terminal state)? A directory already gc'ed counts as ended."""
+        rec = self.tracked.get(rid)
+        if rec is not None:
+            return rec["state"] in TERMINAL
+        if not is_real_dir(self._dir(rid)):
+            return True
+        try:
+            return self._read_json(rid, "status.json").get("state") in TERMINAL
+        except (OSError, ValueError, Invalid):
+            return False
 
     def _markers(self, kind):
         out = []
@@ -773,20 +876,32 @@ class Daemon:
         for rec in list(self.tracked.values()):
             if rec["state"] in ACTIVE:
                 self._update_placed(rec, jobs_by_name.get(rec.get("job")), pods_by_job.get(rec.get("job")), now)
+        self._prune_idle(pods_by_job, now)
 
         cap = capacity(pods, jobs, self.cfg, metrics)
         queue = self._load_queue(now)
         active = [r for r in self.tracked.values() if r["state"] in ACTIVE]
-        decisions, nodes_after = place(queue, cap["nodes"], self.cfg, len(active),
-                                       sum(r.get("gpus") or 0 for r in active))
-        position = 0
+        idle = list(self.idle.values())
+        decisions, nodes_after = place(queue, cap["nodes"], self.cfg, len(active) + len(idle),
+                                       sum(r.get("gpus") or 0 for r in active) + sum(p["gpus"] for p in idle), idle)
+        position, blocked = 0, False
         for req, dec in decisions:
             rec = self.tracked[req["id"]]
-            if "node" in dec:
+            if "reuse" in dec:
+                if not self._handoff(rec, req, dec["reuse"], jobs_by_name.get(dec["reuse"]["job"]), now):
+                    position += 1
+                    rec.update(queue_position=position)
+            elif "node" in dec:
                 self._create(rec, req, dec, now)
             else:
                 position += 1
+                blocked = blocked or dec["reason"] in ("Cap", "NoFit")
                 rec.update(state="queued", reason=dec["reason"], message=dec["message"], queue_position=position)
+        if blocked:  # an idle pod nobody took must not keep my next job waiting
+            for name in list(self.idle):
+                log.info("releasing idle pod %s: a queued job cannot use it", name)
+                self.kube.delete_job(name)
+                del self.idle[name]
 
         for rec in list(self.tracked.values()):
             self._write_status(rec)
@@ -840,10 +955,19 @@ class Daemon:
         self._finish(rec, "killed", "Killed", "killed by gq kill", now)
 
     def _update_placed(self, rec, job, pod, now):
-        st = derive_state(job, pod, self._exit_code(rec["id"]))
+        started = self._started(rec["id"])
+        if rec.get("reused") and started is None:
+            # Handed to an idle pod that has not started it yet. Never fall back to the container's
+            # start time here: that belongs to the previous job and would time this one out.
+            if main_running(pod) and (now - parse_ts(rec["placed"])).total_seconds() < self.cfg["reuse_grace"] + 60:
+                return
+            self._requeue(rec, "HandoffFailed", "the pod ended before taking this job; placing it again")
+            return
+        st = derive_state(job, pod, self._exit_code(rec["id"]), started)
         if st["state"] in TERMINAL:
             rec.update({k: v for k, v in st.items() if v is not None or k in ("reason", "message")})
             self._finish(rec, st["state"], st["reason"], st["message"], now)
+            self._maybe_idle(rec, job, pod, now)
             return
         rec.update(state=st["state"], reason=st["reason"], message=st["message"],
                    node=st["node"] or rec.get("node"), started=rec.get("started") or st["started"])
@@ -860,11 +984,64 @@ class Daemon:
             # Our capacity estimate was wrong (someone took the slot). Re-place on a new Job name.
             self.kube.delete_job(rec["job"])
             log.info("re-placing %s: %s", rec["id"], rec.get("message"))
-            rec.update(state="queued", reason="Replace", message="lost the scheduling race; re-placing",
-                       job=None, node=None, gpus=None, cpu=None, mem=None, cpu_request=None, mem_request=None,
-                       attempt=rec.get("attempt", 1) + 1)
-            os.close(os.open(os.path.join(self.spool, rec["id"] + ".submit"),
-                             os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644))
+            self._requeue(rec, "Replace", "lost the scheduling race; re-placing")
+
+    def _requeue(self, rec, reason, message):
+        rec.update(state="queued", reason=reason, message=message, job=None, node=None, gpus=None, cpu=None,
+                   mem=None, cpu_request=None, mem_request=None, reused=None, pod_since=None, started=None,
+                   attempt=rec.get("attempt", 1) + 1)
+        os.close(os.open(os.path.join(self.spool, rec["id"] + ".submit"),
+                         os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644))
+
+    def _maybe_idle(self, rec, job, pod, now):
+        """A GPU job ended by its own exit while its pod still runs: the worker now waits for a takeover."""
+        try:
+            grace = int(((job or {}).get("metadata", {}).get("annotations") or {}).get("gq/reuse-grace") or 0)
+        except ValueError:
+            grace = 0
+        if grace <= 0 or self.cfg["reuse_grace"] <= 0 or not rec.get("gpus") or rec.get("exit_code") is None \
+                or not main_running(pod):
+            return
+        self.idle[rec["job"]] = {"job": rec["job"], "rid": rec["id"], "node": pod["spec"].get("nodeName"),
+                                 "gpus": rec["gpus"], "cpu": float(rec["cpu"]), "mem": parse_mem(rec["mem"]),
+                                 "since": now, "grace": grace, "pod_since": rec.get("pod_since") or rec.get("placed")}
+
+    def _prune_idle(self, pods_by_job, now):
+        margin = 2 * self.cfg["loop_interval"] + 1  # the worker started waiting a little before we saw it
+        for name, p in list(self.idle.items()):
+            if not main_running(pods_by_job.get(name)) or (now - p["since"]).total_seconds() > p["grace"] - margin:
+                del self.idle[name]
+
+    def _handoff(self, rec, req, pod, job, now):
+        """Give queued job rec to an idle pod: extend the Job's deadline, then write <prev>/next."""
+        del self.idle[pod["job"]]  # used or unusable after this either way
+        try:
+            start = parse_ts(((job or {}).get("status") or {}).get("startTime")) or now
+            old = ((job or {}).get("spec") or {}).get("activeDeadlineSeconds") or 0
+            need = int((now - start).total_seconds()) + req["time"] + pod["grace"] + self.cfg["deadline_slack"]
+            self.kube.patch_job_deadline(pod["job"], max(old, need))
+        except Exception as e:
+            log.warning("cannot extend %s for %s, not reusing it: %s", pod["job"], rec["id"], e)
+            return False
+        line = rec["id"] + (" %d %d" % (req["task_index"], req["task_count"]) if req.get("group") else "") + "\n"
+        try:
+            fd = os.open(os.path.join(self._dir(pod["rid"]), "next"),
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        except OSError as e:  # FileExistsError: the worker gave up first
+            log.info("pod of %s closed before taking %s: %s", pod["rid"], rec["id"], e)
+            return False
+        try:
+            os.write(fd, line.encode())
+        finally:
+            os.close(fd)
+        rcpu, rmem = requests_for(pod["cpu"], pod["mem"], self.cfg)
+        rec.update(state="pending", reason="Handoff", message="taking over the pod of %s" % pod["rid"],
+                   queue_position=None, node=pod["node"], gpus=pod["gpus"], cpu=pod["cpu"], mem=fmt_mem(pod["mem"]),
+                   cpu_request=rcpu, mem_request=fmt_mem(rmem), job=pod["job"], placed=iso(now), pinned=False,
+                   reused=True, pod_since=pod["pod_since"])
+        unlink_quiet(os.path.join(self.spool, rec["id"] + ".submit"))
+        log.info("handed %s to the pod of %s (%s, %d GPU)", rec["id"], pod["rid"], pod["node"], pod["gpus"])
+        return True
 
     def _reject(self, rid, reason, message, now):
         rec = self.tracked.get(rid) or {"id": rid, "backend": "pod", "submitted": None}
@@ -888,6 +1065,9 @@ class Daemon:
                     req = validate(self._read_json(rid, "request.json"), self.cfg)
                     if req["id"] != rid:
                         raise Invalid("id does not match its directory")
+                    missing = [a for a in req.get("after") or [] if not is_real_dir(self._dir(a))]
+                    if missing:
+                        raise Invalid("after: no such job %s" % ", ".join(missing))
                 except (OSError, ValueError, Invalid) as e:
                     self._reject(rid, "Invalid", str(e), now)
                     continue
@@ -895,9 +1075,18 @@ class Daemon:
                                                 "time", "wait_timeout", "submitted")}
                 rec.update(backend="pod", state="queued", reason=None, message=None, queue_position=None,
                            gpus=None, gpus_requested=req["gpus"], cpu=None, mem=None, node=None, job=None,
-                           attempt=1, placed=None, started=None, finished=None, exit_code=None, _req=req)
+                           attempt=1, placed=None, started=None, finished=None, exit_code=None,
+                           after=req.get("after"), ready=None, _req=req)
                 self.tracked[rid] = rec
-            if (now - parse_ts(rec["submitted"])).total_seconds() > rec["wait_timeout"]:
+            deps = [a for a in rec["_req"].get("after") or [] if not self._done(a)]
+            if deps:  # not eligible yet; does not hold up the FIFO or count toward max_queue
+                rec.update(state="queued", reason="After", queue_position=None,
+                           message="waiting for %s" % ", ".join(deps[:3]) + (" and %d more" % (len(deps) - 3)
+                                                                         if len(deps) > 3 else ""))
+                continue
+            if rec["_req"].get("after") and not rec.get("ready"):
+                rec["ready"] = iso(now)  # --wait-timeout counts from here
+            if (now - parse_ts(rec.get("ready") or rec["submitted"])).total_seconds() > rec["wait_timeout"]:
                 unlink_quiet(os.path.join(self.spool, rid + ".submit"))
                 self._finish(rec, "expired", "WaitTimeout",
                              "did not start within --wait-timeout (%ds); last: %s"
@@ -928,6 +1117,7 @@ class Daemon:
 
     def _write_capacity(self, now, cap, nodes_after, queued):
         active = [r for r in self.tracked.values() if r["state"] in ACTIVE]
+        idle = list(self.idle.values())
         nodes = [{"name": nd["name"], "gpu_free": nd["gpu_free"],
                   "gpu_used": self.cfg["_node"]["gpu"] - nd["gpu_free"],
                   "cpu_req_free": round(nd["cpu_req_free"], 1),
@@ -940,9 +1130,11 @@ class Daemon:
             "total_gpu_free": sum(nd["gpu_free"] for nd in nodes) if nodes else None,
             "max_gpu_free_on_node": max(nd["gpu_free"] for nd in nodes) if nodes else None,
             "gpu_waiting": cap["gpu_waiting"],
-            "gq_gpus_in_use": sum(r.get("gpus") or 0 for r in active),
+            "gq_gpus_in_use": sum(r.get("gpus") or 0 for r in active) + sum(p["gpus"] for p in idle),
             "gq_gpus_cap": self.cfg["max_gpus_total"],
-            "gq_running": len(active), "gq_max_running": self.cfg["max_running"],
+            "gq_running": len(active) + len(idle), "gq_max_running": self.cfg["max_running"],
+            "idle_pods": [{"job": p["job"], "node": p["node"], "gpus": p["gpus"],
+                           "idle_seconds": int((now - p["since"]).total_seconds()), "after": p["rid"]} for p in idle],
             "queue_length": queued,
             "node_capacity": self.cfg["node_capacity"],
         }

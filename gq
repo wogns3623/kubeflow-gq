@@ -496,6 +496,14 @@ def cmd_submit(a, follow_logs=False):
         cwd = os.path.abspath(raw_cwd)
     for sub in ("jobs", "spool"):
         os.makedirs(os.path.join(root(), sub), exist_ok=True)
+    after = []
+    for x in a.after or []:
+        if a.local:
+            raise Usage("--after needs gqd and does not work with --local")
+        for t in expand(x):
+            if load_status(t).get("backend") == "local":
+                raise Usage("--after %s: that is a --local job, which gqd cannot watch" % t)
+            after.append(t)
 
     env = capture_env(a.env, a.clean_env)
     base, n = new_id(), a.array
@@ -510,12 +518,14 @@ def cmd_submit(a, follow_logs=False):
                "submitted": submitted}
         if n:
             req.update(group=base, task_index=k, task_count=n)
+        if after:
+            req["after"] = sorted(set(after))
         write_json(os.path.join(d, "request.json"), req)
         with open(os.path.join(d, "run.sh"), "w") as f:
             f.write(render_run_sh(cwd, cmd, env))
         os.chmod(os.path.join(d, "run.sh"), 0o755)
         st = {k2: req.get(k2) for k2 in ("id", "group", "task_index", "task_count", "name", "owner", "backend",
-                                         "time", "wait_timeout", "cwd", "submitted")}
+                                         "time", "wait_timeout", "cwd", "submitted", "after")}
         st.update(state="submitted", reason=None, message=None, gpus=None, gpus_requested=[lo, hi], node=None,
                   started=None, finished=None, exit_code=None)
         write_json(os.path.join(d, "status.json"), st)
@@ -603,6 +613,8 @@ def row(st):
     why = st.get("reason") or ""
     if st.get("message") and state not in ("succeeded",):
         why = (why + ": " if why else "") + st["message"]
+    if st.get("reused") and state == "running":
+        why = "reused pod (held %s)" % fmt_dur(age(st.get("pod_since")))
     if st.get("exit_code") is not None and state != "succeeded":
         why = "exit %s %s" % (st["exit_code"], why)
     where = st.get("node") or (("local:" + st["host"]) if st.get("host") else "-")
@@ -633,10 +645,13 @@ def cmd_ps(a):
         return 0
     cap = read_json(os.path.join(root(), "capacity.json")) or {}
     free = shutil.disk_usage(root()).free if os.path.isdir(root()) else 0
-    print("gq %s/%s GPU · %s/%s running · queue %s · cluster free GPU %s (max %s on one node) · PVC free %.1fT"
+    idle = cap.get("idle_pods") or []
+    print("gq %s/%s GPU · %s/%s running%s · queue %s · cluster free GPU %s (max %s on one node) · PVC free %.1fT"
           % (cap.get("gq_gpus_in_use", "?"), cap.get("gq_gpus_cap", "?"), cap.get("gq_running", "?"),
-             cap.get("gq_max_running", "?"), cap.get("queue_length", "?"), cap.get("total_gpu_free", "?"),
-             cap.get("max_gpu_free_on_node", "?"), free / 2**40))
+             cap.get("gq_max_running", "?"),
+             " (%d idle pod%s waiting for a takeover)" % (len(idle), "" if len(idle) == 1 else "s") if idle else "",
+             cap.get("queue_length", "?"), cap.get("total_gpu_free", "?"), cap.get("max_gpu_free_on_node", "?"),
+             free / 2**40))
     if any(s.get("backend") == "pod" and s.get("state") not in TERMINAL for s in sts):
         heartbeat_warning()
     if sts:
@@ -722,6 +737,8 @@ def build_parser():
         p.add_argument("--env", action="append", metavar="K=V", help="set or override an environment variable")
         p.add_argument("--clean-env", action="store_true", help="do not pass the current environment")
         p.add_argument("--cwd", help="working directory (default: current; must be on a mounted volume)")
+        p.add_argument("--after", action="append", metavar="ID",
+                       help="start only after these jobs end, whatever their result (repeatable; group ids expand)")
         p.add_argument("cmd", nargs=argparse.REMAINDER, help="-- command [args...]")
 
     job_opts(sub.add_parser("submit", help="queue a job and print its id"))

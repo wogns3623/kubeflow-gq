@@ -230,7 +230,8 @@ def test_build_job_keeps_secrets_off_the_spec():
     assert tiny["spec"]["template"]["spec"]["containers"][0]["resources"]["requests"] == {"cpu": "500m", "memory": "1Gi"}
     env = {e["name"]: e["value"] for e in main["env"]}
     assert env == {"GQ_ID": r["id"], "GQ_GPUS": "2", "GQ_CPU": "30", "GQ_TASK_INDEX": "3", "GQ_TASK_COUNT": "4"}
-    assert [v["name"] for v in spec["volumes"]] == ["v0", "dshm"] and "/home/irteam/gq/jobs/$GQ_ID" in main["command"][2]
+    assert [v["name"] for v in spec["volumes"]] == ["v0", "dshm"] and "root=/home/irteam/gq;" in main["command"][2]
+    assert j["metadata"]["annotations"]["gq/reuse-grace"] == "60"
     multi = cfg(volumes=[{"pvc": "ws", "mountPath": "/home/irteam"},
                          {"pvc": "data", "mountPath": "/home/irteam/data-vol1", "subPath": "u1", "readOnly": True}])
     mj = gqd.build_job(gqd.validate(req(), multi), "n-a", 1, 15.0, 245 * 2**30, 1, multi)
@@ -299,6 +300,10 @@ class FakeKube:
         self.jobs[name] = dict(copy.deepcopy(body), status={})
         self.created_nodes[name] = body["metadata"]["annotations"]["gq/node"]
         return True
+
+    def patch_job_deadline(self, name, seconds):
+        assert self.own.match(name), "patched another instance's Job: " + name
+        self.jobs[name]["spec"]["activeDeadlineSeconds"] = seconds
 
     def delete_job(self, name):
         assert self.own.match(name), "deleted another instance's Job: " + name
@@ -718,6 +723,136 @@ def test_completion():
         assert comp("gqctl", "bogus", "") == []
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_worker_script():
+    """The Job's bash worker: runs a job, takes a handed-over one, then closes `next` and exits."""
+    tmp = tempfile.mkdtemp()
+    try:
+        jobs = os.path.join(tmp, "jobs")
+        a, b = "261108-070000-aaaa", "261108-070001-bbbb-2"
+        for rid, body in ((a, "echo A; exit 3"), (b, 'echo "$GQ_ID $GQ_TASK_INDEX $GQ_TASK_COUNT"')):
+            os.makedirs(os.path.join(jobs, rid))
+            open(os.path.join(jobs, rid, "run.sh"), "w").write(body + "\n")
+        quick = gqd.WORKER % {"root": tmp, "grace": 0}
+        r = subprocess.run(["bash", "-c", quick], env=dict(os.environ, GQ_ID=a), timeout=10)
+        assert r.returncode == 3 and not os.path.exists(os.path.join(jobs, a, "next"))   # grace 0: old behaviour
+        os.remove(os.path.join(jobs, a, "exit"))
+        w = subprocess.Popen(["bash", "-c", gqd.WORKER % {"root": tmp, "grace": 2}], env=dict(os.environ, GQ_ID=a))
+        end = time.monotonic() + 10
+        while not os.path.exists(os.path.join(jobs, a, "exit")) and time.monotonic() < end:
+            time.sleep(0.05)
+        fd = os.open(os.path.join(jobs, a, "next"), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        os.write(fd, ("%s 2 5\n" % b).encode())
+        os.close(fd)
+        assert w.wait(timeout=15) == 0                                   # exit code of the last job
+        read = lambda rid, f: open(os.path.join(jobs, rid, f)).read().strip()
+        assert read(a, "exit") == "3" and read(b, "exit") == "0" and read(b, "log") == "%s 2 5" % b
+        assert gqd.parse_ts(read(b, "started")) and read(b, "next") == "closed"   # closed it, so gqd cannot
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_reuse_rules():
+    c = cfg(max_gpus_total=2)
+    idle = [{"job": "gq-t-x-a1", "rid": "x", "node": "n-a", "gpus": 1, "cpu": 15.0, "mem": 245 * 2**30}]
+    nodes = gqd.capacity([], [], c)["nodes"]
+    one, two = gqd.validate(req(), c), gqd.validate(req("261108-061530-b2b2", gpus=(2, 2)), c)
+    # cap is full (1 idle + 1 running), yet the 1-GPU job takes over the idle pod: it adds nothing
+    dec = gqd.place([one], nodes, c, running=2, gq_gpus=2, idle=idle)[0]
+    assert dec[0][1]["reuse"] is idle[0] and dec[0][1]["node"] == "n-a"
+    assert "reuse" not in gqd.place([two], nodes, c, 1, 1, idle)[0][0][1]       # other GPU count: no
+    big_mem = gqd.validate(req(mem="300Gi"), c)
+    assert not gqd.reusable(big_mem, idle[0], c)                                   # needs more memory than the pod
+    assert gqd.reusable(gqd.validate(req(gpus=(1, 4)), c), idle[0], c)             # range containing it: yes
+    for bad in (301, -1, 1.5, True):
+        try:
+            cfg(reuse_grace=bad)
+            raise AssertionError("reuse_grace %r accepted" % (bad,))
+        except ValueError:
+            pass
+    assert gqd.validate(req(after=["261108-061530-c3c3", "261108-061530-c3c3"]), c)["after"] == ["261108-061530-c3c3"]
+    for bad in ([], ["nope"], ["261108-061530-a1b2"], "261108-061530-c3c3"):
+        try:
+            gqd.validate(req(after=bad), c)
+            raise AssertionError("after %r accepted" % (bad,))
+        except gqd.Invalid:
+            pass
+
+
+def test_reuse_end_to_end():
+    with sandbox() as home:
+        c = cfg(volumes=[{"pvc": "ws", "mountPath": home}], root=home + "/gq", max_gpus_total=2)
+        kube, clock = FakeKube(), Clock()
+        d = gqd.Daemon(c, os.environ["GQ_ROOT"], kube, clock=clock)
+        jd = lambda rid: os.path.join(os.environ["GQ_ROOT"], "jobs", rid)
+        put = lambda rid, f, text: open(os.path.join(jd(rid), f), "w").write(text)
+        sub = lambda *a: json.loads(run_gq("submit", "--time", "1h", *a, "--", "true")[1])["id"]
+
+        a = sub("--gpus", "1")
+        d.loop_once()
+        job_a, node_a = status(a)["job"], status(a)["node"]
+        kube.run(job_a, node_a)
+        put(a, "started", gqd.iso(clock()))
+        d.loop_once()
+        assert status(a)["state"] == "running"
+        b = sub("--gpus", "1", "--after", a)
+        d.loop_once()
+        assert (status(b)["state"], status(b)["reason"]) == ("queued", "After")
+
+        put(a, "exit", "0\n")                     # A ends; its pod keeps running (the worker waits)
+        d.loop_once()
+        sb = status(b)
+        assert status(a)["state"] == "succeeded" and status(b)["after"] == [a]
+        assert (sb["state"], sb["reason"], sb["job"], sb["node"], sb["reused"]) == ("pending", "Handoff", job_a, node_a, True)
+        assert open(os.path.join(jd(a), "next")).read() == b + "\n" and len(kube.jobs) == 1
+        assert kube.jobs[job_a]["spec"]["activeDeadlineSeconds"] >= 3600 + 60 + 1800
+        clock.advance(5)
+        d.loop_once()
+        assert status(b)["state"] == "pending"     # no `started` yet: not the old container's start time
+        put(b, "started", gqd.iso(clock()))
+        d.loop_once()
+        assert status(b)["state"] == "running" and status(b)["started"] == gqd.iso(clock())
+        assert "reused pod (held" in gq.row(status(b))[6]
+
+        put(b, "exit", "0\n")
+        d.loop_once()
+        assert status(b)["state"] == "succeeded"
+        capdoc = json.load(open(os.path.join(os.environ["GQ_ROOT"], "capacity.json")))
+        assert [p["job"] for p in capdoc["idle_pods"]] == [job_a] and capdoc["gq_gpus_in_use"] == 1
+        # a 2-GPU job cannot use the idle 1-GPU pod and is over the cap because of it: release it
+        c2 = sub("--gpus", "2")
+        d.loop_once()
+        assert job_a in kube.deleted and not d.idle and status(c2)["reason"] == "Cap"
+        d.loop_once()
+        assert status(c2)["state"] == "pending"
+        kube.delete_job(status(c2)["job"])
+
+        # the worker closed first: the handoff fails and the job is placed normally
+        e = sub("--gpus", "1")
+        d.loop_once()
+        kube.run(status(e)["job"], status(e)["node"])
+        d.loop_once()
+        f = sub("--gpus", "1", "--after", e)
+        put(e, "next", "closed\n")
+        put(e, "exit", "0\n")
+        d.loop_once()
+        assert status(f)["state"] == "queued" and not d.idle
+        d.loop_once()
+        assert status(f)["state"] == "pending" and status(f)["job"] != status(e)["job"] and not status(f).get("reused")
+
+        # the pod died after the handoff but before starting the job: placed again
+        job_f = status(f)["job"]
+        kube.run(job_f, status(f)["node"])
+        d.loop_once()
+        g = sub("--gpus", "1")
+        put(f, "exit", "0\n")
+        d.loop_once()
+        assert status(g)["job"] == job_f and status(g)["reason"] == "Handoff"
+        kube.finish(job_f, 0)
+        d.loop_once()
+        sg = status(g)
+        assert sg["reason"] in ("HandoffFailed", "Created") and sg["attempt"] == 2 and not sg.get("reused")
 
 
 def test_local_backend():
