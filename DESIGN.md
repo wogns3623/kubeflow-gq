@@ -559,6 +559,9 @@ spec:
 **배포와 설치:** 모두 사용자 PC에서 `gqctl`로 한다(README.md 설치 절).
 - `gqctl up`: ConfigMap(gqd.py + 설정)을 apply하고, Deployment를 apply한 뒤 rollout restart한다.
 - `gqctl install`: 실행 중인 노트북으로 `kubectl cp`해서 `gq`와 스킬을 PVC에 둔다. 에이전트가 이 파일들을 고쳐도 권한 문제는 없다.
+- `gqctl install`은 `<root>/env.sh`도 쓰고, 노트북의 셸 rc에 그것을 읽는 한 줄을 표식과 함께 넣는다(중복 없음, symlink인 rc는 건드리지 않음). Claude Code 설정에는 `gq` 허용과 `kubectl` 금지를 합친다(처음 한 번 백업).
+- `gqctl lockdown`은 기본적으로 설정의 공유 볼륨을 마운트하는 노트북을 **전부** 고른다. 7.2의 규칙("그 볼륨을 마운트하는 pod 중 토큰을 가진 것은 gqd뿐")을 그대로 옮긴 것이다. 실행 중이던 노트북은 재시작을 기다린 뒤 토큰이 사라졌는지 확인한다.
+- `gqctl setup`은 init(설정이 없을 때) → probe → install → up → end-to-end 확인을 한 번에 한다. 마지막 확인은 노트북 안에서 실제로 `gq run`(CPU, 그리고 `--gpu`면 GPU 1장)을 돌려 gqd까지 전 경로를 검증한다. 노트북을 재시작시키는 lockdown은 `--lockdown`을 줄 때만 한다.
 
 ## 9. 사람이 쓰는 법 (요약)
 

@@ -23,7 +23,7 @@
 
 1. [파일 구성](#파일-구성)
 2. [요구 사항](#요구-사항)
-3. [설치](#설치) (init → probe → install → up → 확인 → lockdown → 에이전트 설정)
+3. [설치](#설치) (`gqctl setup` 한 번, 또는 단계별)
 4. [사용법](#사용법)
 5. [MLXP에서 쓸 때](#mlxp에서-쓸-때)
 6. [여러 사람이 쓸 때](#여러-사람이-쓸-때)
@@ -66,6 +66,30 @@
 ## 설치
 
 모든 `gqctl` 명령은 **노트북 PC에서, 이 저장소 루트에서** 실행한다. 아래 예시 값은 `alice`의 경우다.
+
+### 빠른 설치: `gqctl setup`
+
+상시 노트북을 **켜 둔 상태에서** 한 번 실행하면 아래 1–5, 7단계를 차례로 진행한다.
+
+```bash
+./gqctl setup --notebook alice-cpu --gpu
+```
+
+1. **설정:** `gq.config.json`을 만든다. 이미 있으면 그대로 쓰고, `--reinit`을 주면 다시 만든다. 일반 Kubeflow라면 `--nodes`, `--node-selector`, `--node-capacity`를 같이 줄 수 있다.
+2. **probe:** 확인용 Job을 한 번 돌린다(`--skip-probe`로 건너뛴다).
+3. **설치:** gq, 에이전트 스킬, `<root>/env.sh`를 넣는다. 셸 rc(`~/.bashrc`, 있으면 `~/.zshrc`)에는 env.sh를 읽는 한 줄을 추가하고, Claude Code 설정에는 `gq` 허용과 `kubectl` 금지를 합친다.
+4. **gqd 배포:** gqd를 배포하고 heartbeat가 올라오는지 기다린다.
+5. **end-to-end 확인:** 노트북 안에서 **실제 gq 작업**을 돌린다. CPU 작업은 항상, `--gpu`를 주면 GPU 1장 작업까지 돌린다.
+
+각 단계는 같은 일을 반복해도 안전하다. 코드를 갱신한 뒤 다시 실행해도 된다.
+
+마지막으로 토큰을 끈다(6단계). 실행 중인 노트북이 재시작되므로 따로 실행한다. `setup`에 `--lockdown`을 붙여 한 번에 해도 된다.
+
+```bash
+./gqctl lockdown
+```
+
+단계별로 하고 싶거나 문제가 생긴 단계만 다시 하려면 아래를 따른다.
 
 ### 1. 설정 만들기: `gqctl init`
 
@@ -158,14 +182,14 @@ RWX 볼륨이 하나도 없으면 `init`이 설정을 만들지 않고 이유를
 ./gqctl install --notebook alice-cpu
 ```
 
-출력된 두 줄을 **노트북의 셸 설정**(`~/.bashrc` 등)에 추가한다.
+함께 하는 일:
+- **환경 파일:** `<root>/env.sh`(`GQ_ROOT`, `PATH`)를 쓴다.
+- **셸 rc:** `~/.bashrc`(있으면 `~/.zshrc`도)에 `. <root>/env.sh` 한 줄을 표식 주석과 함께 넣는다. 여러 번 실행해도 한 번만 들어간다.
+  - rc 파일이 symlink면(다른 곳에서 관리하는 경우) 건드리지 않고 넣을 줄만 알려준다.
+  - `--no-shell-rc`로 끄고, `--shell-rc FILE`로 넣을 파일을 바꾼다.
+- **Claude Code 설정:** `~/.claude/settings.json`에 `allow: Bash(gq *)`, `deny: Bash(kubectl *)`를 합친다. 처음 한 번 `settings.json.before-gq`로 백업하고, `--no-claude-settings`로 끈다.
 
-```bash
-export GQ_ROOT=/home/irteam/gq
-export PATH="$GQ_ROOT/bin:$PATH"
-```
-
-볼륨이 공유되므로, 같은 볼륨을 마운트하는 내 다른 노트북에서도 같은 `gq`를 쓸 수 있다.
+끝나면 노트북에서 새 터미널을 열거나 `source ~/.bashrc`를 실행한다. 볼륨이 공유되므로, 같은 볼륨을 마운트하는 내 다른 노트북에서도 같은 `gq`를 쓸 수 있다.
 
 > 스킬은 노트북 사용자의 `$HOME/.claude/skills/gq`에 설치된다. 에이전트가 노트북에서 읽기만 하면 되므로 RWX일 필요는 없다. 다만 홈이 PVC가 아니면 노트북을 재시작할 때 사라진다. 다른 위치가 필요하면 `--skills-dir`로 지정한다.
 
@@ -200,10 +224,12 @@ Kubeflow 노트북 pod에는 보통 네임스페이스 편집 권한을 가진 �
 > ⚠️ 실행 중인 노트북은 **재시작된다.** tmux 세션, 실행 중인 프로세스, `--local` gq 작업이 모두 사라진다. 정지된 노트북은 다음에 켤 때 적용된다.
 
 ```bash
-./gqctl lockdown --prefix alice-
+./gqctl lockdown
 ```
 
-특정 노트북만 고르려면 `--notebook NAME`을 여러 번 쓴다. 노트북이 다시 뜨면 출력된 `kubectl exec ... ls /var/run/secrets/kubernetes.io/serviceaccount` 명령으로 `No such file or directory`가 나오는지 확인한다.
+- **대상:** 기본값은 설정의 공유 볼륨(`volumes`)을 마운트하는 노트북 전부다. 직접 고르려면 `--notebook NAME`(여러 번 가능)이나 `--prefix PREFIX`를 쓴다.
+- **확인:** 실행 중이던 노트북은 재시작될 때까지 기다렸다가, service account 토큰이 사라졌는지 확인한다. KFP 토큰이 남아 있는지도 알려준다. `--no-wait`로 건너뛸 수 있다.
+- **정지된 노트북:** 다음에 켤 때 적용된다.
 
 - **MLXP의 KFP 토큰:** MLXP 노트북에는 KFP 토큰(`/var/run/secrets/kubeflow/pipelines`)이 웹훅으로 따로 들어갈 수 있다. 남아 있다면 DESIGN.md 12장의 열린 질문을 본다.
 - **설정 초기화:** MLXP UI에서 노트북 설정을 수정하면 이 값이 초기화될 수 있다. 수정한 뒤에는 위 확인을 다시 한다.
@@ -211,7 +237,7 @@ Kubeflow 노트북 pod에는 보통 네임스페이스 편집 권한을 가진 �
 
 ### 7. 에이전트 설정 (Claude Code, 노트북 안)
 
-3단계에서 스킬이 설치되었다. 승인 창 없이 `gq`를 쓰게 하고, `kubectl`은 바로 실패하게 하려면 `~/.claude/settings.json`에 다음을 **합친다.**
+3단계(`install`)에서 스킬 설치와 아래 권한 설정까지 자동으로 된다. `--no-claude-settings`를 줬거나 다른 위치를 쓴다면 `~/.claude/settings.json`에 다음을 **합친다.**
 
 ```json
 {

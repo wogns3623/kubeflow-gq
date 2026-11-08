@@ -643,6 +643,53 @@ def test_scheduler_placement_mode():
         assert "no node list configured" in run_gq("capacity")[1]
 
 
+def test_gqctl_notebook_side_scripts():
+    """The scripts gqctl install runs in the notebook, run here against a temp $HOME."""
+    import subprocess
+    tmp = tempfile.mkdtemp(prefix="gqrc-")
+    try:
+        home, root = os.path.join(tmp, "home"), os.path.join(tmp, "home", "gq")
+        os.makedirs(os.path.join(root, "bin"))
+        env = dict(os.environ, HOME=home)
+        with open(os.path.join(root, "env.sh"), "w") as f:
+            f.write(gqctl.render_env_sh(root))
+        # shell rc: added once, idempotent, ~/.zshrc only if present, symlinks left alone
+        script = gqctl.render_rc_script(root)
+        out1 = subprocess.run(["bash", "-s"], input=script, text=True, capture_output=True, env=env, check=True).stdout
+        out2 = subprocess.run(["bash", "-s"], input=script, text=True, capture_output=True, env=env, check=True).stdout
+        assert "ADDED %s/.bashrc" % home in out1 and "PRESENT %s/.bashrc" % home in out2 and ".zshrc" not in out1
+        rc = open(os.path.join(home, ".bashrc")).read()
+        assert rc.count(gqctl.RC_MARKER) == 1
+        os.symlink(os.path.join(tmp, "managed-zshrc"), os.path.join(home, ".zshrc"))
+        open(os.path.join(tmp, "managed-zshrc"), "w").close()
+        out3 = subprocess.run(["bash", "-s"], input=script, text=True, capture_output=True, env=env, check=True).stdout
+        assert "SKIP_SYMLINK %s/.zshrc" % home in out3 and open(os.path.join(tmp, "managed-zshrc")).read() == ""
+        # sourcing the rc (twice) gives GQ_ROOT and gq on PATH exactly once
+        probe = 'source "$HOME/.bashrc"; source "$HOME/.bashrc"; echo "$GQ_ROOT"; echo "$PATH" | tr ":" "\\n" | grep -c "^%s/bin$"' % root
+        res = subprocess.run(["bash", "-c", probe], text=True, capture_output=True, env=env, check=True).stdout.split()
+        assert res == [root, "1"], res
+        # Claude settings: created, merged into existing (with one backup), idempotent, unparseable left alone
+        sp = os.path.join(home, ".claude", "settings.json")
+        run_py = lambda: subprocess.run(["python3", "-", sp, json.dumps(gqctl.CLAUDE_RULES)],
+                                        input=gqctl.CLAUDE_SETTINGS_PY, text=True, capture_output=True, check=True).stdout
+        assert run_py().startswith("UPDATED")
+        json.dump({"model": "x", "permissions": {"allow": ["Bash(ls *)"], "deny": []}}, open(sp, "w"))
+        assert run_py().startswith("UPDATED") and run_py().startswith("PRESENT")
+        merged = json.load(open(sp))
+        assert merged["model"] == "x" and merged["permissions"]["allow"] == ["Bash(ls *)", "Bash(gq *)"]
+        assert merged["permissions"]["deny"] == ["Bash(kubectl *)"] and os.path.exists(sp + ".before-gq")
+        open(sp, "w").write("{not json")
+        assert run_py().startswith("SKIP_UNPARSEABLE") and open(sp).read() == "{not json"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    # lockdown picks every notebook that mounts one of the shared volumes
+    nbs = [{"metadata": {"name": n}, "spec": {"template": {"spec": {"volumes": [
+        {"name": "v", "persistentVolumeClaim": {"claimName": c}} for c in claims]}}}}
+        for n, claims in (("alice-cpu", ["alice-ws"]), ("alice-gpu", ["alice-ws", "alice-data"]),
+                          ("bob-gpu", ["bob-ws"]), ("alice-tmp", []))]
+    assert gqctl.notebooks_using(nbs, ["alice-ws"]) == ["alice-cpu", "alice-gpu"]
+
+
 def test_local_backend():
     with sandbox():
         code, out, err = run_gq("run", "--local", "--time", "30s", "--", "bash", "-c", "echo hello; exit 3")
