@@ -58,7 +58,9 @@ DEFAULTS = {
     "max_wait_timeout": 86400,
     "max_gpus_per_job": 8,
     "job_ttl_after_finished": 3600,
-    "retention_days": 30,
+    "retention_days": 30,        # job directories (request.json, status.json)
+    "log_retention_days": 1,     # job output (log) and run.sh, which holds the captured environment
+    "event_retention_days": 365,  # <root>/events/YYYY-MM.jsonl, gq's own record (DESIGN 16)
     "loop_interval": 2,
     "metrics_interval": 30,
     "gc_interval": 3600,
@@ -774,12 +776,16 @@ class Daemon:
         self.cfg, self.root, self.kube, self.clock = cfg, root, kube, clock
         self.spool = os.path.join(root, "spool")
         self.jobs_dir = os.path.join(root, "jobs")
-        for d in (self.spool, self.jobs_dir):
+        self.events_dir = os.path.join(root, "events")
+        for d in (self.spool, self.jobs_dir, self.events_dir):
             os.makedirs(d, exist_ok=True)
         self.tracked = {}   # id -> record (status.json content plus private "_" keys)
         self._written = {}  # id -> last status.json text
         self._metrics, self._metrics_at, self._gc_at = None, 0.0, 0.0
         self.idle = {}      # job name -> finished GPU pod waiting for a takeover (DESIGN 15.2)
+        self.pods = {}      # job name -> {"created", "node", "gpus", "tasks"} for this instance's live Jobs
+        self._own = job_name_re(cfg["instance"])
+        self._ended = self._logged_pod_ends()  # Jobs whose pod_ended is already in the event log
         self._recover()
 
     # -- files
@@ -795,6 +801,83 @@ class Daemon:
             return int(read_small(os.path.join(self._dir(rid), "exit"), 32).strip())
         except (OSError, ValueError, Invalid):
             return None
+
+    # -- event log (DESIGN 16): append-only, written only by gqd
+
+    def _event(self, kind, **fields):
+        now = self.clock()
+        doc = {"ts": iso(now), "event": kind}
+        doc.update({k: v for k, v in fields.items() if v is not None})
+        path = os.path.join(self.events_dir, now.strftime("%Y-%m") + ".jsonl")
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+            try:
+                os.write(fd, (json.dumps(doc, sort_keys=True) + "\n").encode())
+            finally:
+                os.close(fd)
+        except OSError as e:
+            log.warning("cannot write event %s: %s", kind, e)
+
+    def _logged_pod_ends(self):
+        """Job names with a pod_ended in this or last month's log, so a restart does not log them twice."""
+        now = self.clock()
+        months = {now.strftime("%Y-%m"), (now.replace(day=1) - dt.timedelta(days=1)).strftime("%Y-%m")}
+        names = set()
+        for m in months:
+            try:
+                with open(os.path.join(self.events_dir, m + ".jsonl"), errors="replace") as f:
+                    for line in f:
+                        if '"pod_ended"' in line:
+                            try:
+                                names.add(json.loads(line).get("job"))
+                            except ValueError:
+                                pass
+            except OSError:
+                pass
+        return names
+
+    def _queue(self, rec, reason, message, position=None):
+        if rec.get("state") != "queued" or rec.get("reason") != reason:
+            self._event("queued", id=rec["id"], reason=reason, message=message)
+        rec.update(state="queued", reason=reason, message=message, queue_position=position)
+
+    def _track_pods(self, jobs, pods_by_job, now):
+        """Log pod_ended once per Job: when it completes/fails, or disappears (deleted)."""
+        listed = {}
+        for j in jobs:
+            name = j["metadata"]["name"]
+            if not self._own.match(name):
+                continue
+            listed[name] = j
+            ann = j["metadata"].get("annotations") or {}
+            if name not in self.pods and name not in self._ended:  # e.g. created before a restart
+                try:
+                    gpus = int(ann.get("gq/gpus") or 0)
+                except ValueError:
+                    gpus = None
+                self.pods[name] = {"created": j["metadata"].get("creationTimestamp"), "node": ann.get("gq/node") or None,
+                                   "gpus": gpus, "tasks": sorted(r["id"] for r in self.tracked.values()
+                                                                 if r.get("job") == name)}
+            pod = pods_by_job.get(name)
+            if pod is not None and name in self.pods:
+                self.pods[name]["node"] = pod["spec"].get("nodeName") or self.pods[name]["node"]
+            if job_finished(j) and name not in self._ended:
+                cond = job_condition(j, "Complete") or job_condition(j, "Failed")
+                ended = (j.get("status") or {}).get("completionTime") or cond.get("lastTransitionTime") or iso(now)
+                self._pod_ended(name, ended, cond.get("reason") or cond["type"])
+        for name in list(self.pods):
+            if name not in listed:
+                self._pod_ended(name, iso(now), "Deleted")
+        self._ended &= set(listed)
+
+    def _pod_ended(self, name, ended, outcome):
+        p = self.pods.pop(name, None) or {}
+        created, end = parse_ts(p.get("created")), parse_ts(ended)
+        self._event("pod_ended", job=name, node=p.get("node"), gpus=p.get("gpus"), created=p.get("created"),
+                    ended=ended, seconds=int((end - created).total_seconds()) if created and end else None,
+                    tasks=p.get("tasks"), outcome=outcome)
+        self._ended.add(name)
+        self.idle.pop(name, None)
 
     def _started(self, rid):
         try:
@@ -877,6 +960,7 @@ class Daemon:
             if rec["state"] in ACTIVE:
                 self._update_placed(rec, jobs_by_name.get(rec.get("job")), pods_by_job.get(rec.get("job")), now)
         self._prune_idle(pods_by_job, now)
+        self._track_pods(jobs, pods_by_job, now)
 
         cap = capacity(pods, jobs, self.cfg, metrics)
         queue = self._load_queue(now)
@@ -896,11 +980,12 @@ class Daemon:
             else:
                 position += 1
                 blocked = blocked or dec["reason"] in ("Cap", "NoFit")
-                rec.update(state="queued", reason=dec["reason"], message=dec["message"], queue_position=position)
+                self._queue(rec, dec["reason"], dec["message"], position)
         if blocked:  # an idle pod nobody took must not keep my next job waiting
             for name in list(self.idle):
                 log.info("releasing idle pod %s: a queued job cannot use it", name)
                 self.kube.delete_job(name)
+                self._event("pod_released", job=name, after=self.idle[name]["rid"], reason="a queued job cannot use it")
                 del self.idle[name]
 
         for rec in list(self.tracked.values()):
@@ -936,6 +1021,12 @@ class Daemon:
     def _finish(self, rec, state, reason, message, now):
         rec.update(state=state, reason=reason, message=message, queue_position=None,
                    finished=rec.get("finished") or iso(now))
+        sub, start, end = parse_ts(rec.get("submitted")), parse_ts(rec.get("started")), parse_ts(rec["finished"])
+        self._event("finished", id=rec["id"], state=state, reason=reason, message=message,
+                    exit_code=rec.get("exit_code"), job=rec.get("job"), node=rec.get("node"), gpus=rec.get("gpus"),
+                    reused=rec.get("reused"), started=rec.get("started"),
+                    ran_seconds=int((end - start).total_seconds()) if start and end else None,
+                    waited_seconds=int((start - sub).total_seconds()) if start and sub else None)
 
     def _kill(self, rid, now):
         rec = self.tracked.get(rid)
@@ -969,8 +1060,12 @@ class Daemon:
             self._finish(rec, st["state"], st["reason"], st["message"], now)
             self._maybe_idle(rec, job, pod, now)
             return
+        prev = rec["state"]
         rec.update(state=st["state"], reason=st["reason"], message=st["message"],
                    node=st["node"] or rec.get("node"), started=rec.get("started") or st["started"])
+        if prev != "running" and rec["state"] == "running":
+            self._event("started", id=rec["id"], job=rec.get("job"), node=rec["node"], gpus=rec.get("gpus"),
+                        started=rec["started"], reused=rec.get("reused"))
         started, submitted = parse_ts(rec.get("started")), parse_ts(rec["submitted"])
         if rec["state"] == "running" and started and (now - started).total_seconds() > rec["time"]:
             self.kube.delete_job(rec["job"])
@@ -987,6 +1082,7 @@ class Daemon:
             self._requeue(rec, "Replace", "lost the scheduling race; re-placing")
 
     def _requeue(self, rec, reason, message):
+        self._event("requeued", id=rec["id"], reason=reason, message=message, job=rec.get("job"))
         rec.update(state="queued", reason=reason, message=message, job=None, node=None, gpus=None, cpu=None,
                    mem=None, cpu_request=None, mem_request=None, reused=None, pod_since=None, started=None,
                    attempt=rec.get("attempt", 1) + 1)
@@ -1005,6 +1101,7 @@ class Daemon:
         self.idle[rec["job"]] = {"job": rec["job"], "rid": rec["id"], "node": pod["spec"].get("nodeName"),
                                  "gpus": rec["gpus"], "cpu": float(rec["cpu"]), "mem": parse_mem(rec["mem"]),
                                  "since": now, "grace": grace, "pod_since": rec.get("pod_since") or rec.get("placed")}
+        self._event("pod_idle", job=rec["job"], after=rec["id"], node=pod["spec"].get("nodeName"), grace=grace)
 
     def _prune_idle(self, pods_by_job, now):
         margin = 2 * self.cfg["loop_interval"] + 1  # the worker started waiting a little before we saw it
@@ -1040,6 +1137,9 @@ class Daemon:
                    cpu_request=rcpu, mem_request=fmt_mem(rmem), job=pod["job"], placed=iso(now), pinned=False,
                    reused=True, pod_since=pod["pod_since"])
         unlink_quiet(os.path.join(self.spool, rec["id"] + ".submit"))
+        self.pods.setdefault(pod["job"], {"created": None, "node": pod["node"], "gpus": pod["gpus"], "tasks": []})
+        self.pods[pod["job"]]["tasks"].append(rec["id"])
+        self._event("handoff", id=rec["id"], job=pod["job"], node=pod["node"], gpus=pod["gpus"], after=pod["rid"])
         log.info("handed %s to the pod of %s (%s, %d GPU)", rec["id"], pod["rid"], pod["node"], pod["gpus"])
         return True
 
@@ -1078,11 +1178,13 @@ class Daemon:
                            attempt=1, placed=None, started=None, finished=None, exit_code=None,
                            after=req.get("after"), ready=None, _req=req)
                 self.tracked[rid] = rec
+                self._event("submitted", id=rid, name=req["name"] or None, owner=req["owner"] or None,
+                            gpus=req["gpus"], time=req["time"], after=req.get("after"), group=req.get("group"),
+                            submitted=req["submitted"])
             deps = [a for a in rec["_req"].get("after") or [] if not self._done(a)]
             if deps:  # not eligible yet; does not hold up the FIFO or count toward max_queue
-                rec.update(state="queued", reason="After", queue_position=None,
-                           message="waiting for %s" % ", ".join(deps[:3]) + (" and %d more" % (len(deps) - 3)
-                                                                         if len(deps) > 3 else ""))
+                self._queue(rec, "After", "waiting for %s" % ", ".join(deps[:3])
+                            + (" and %d more" % (len(deps) - 3) if len(deps) > 3 else ""))
                 continue
             if rec["_req"].get("after") and not rec.get("ready"):
                 rec["ready"] = iso(now)  # --wait-timeout counts from here
@@ -1103,7 +1205,7 @@ class Daemon:
             created = self.kube.create_job(body)
         except Exception as e:
             log.warning("creating %s failed: %s", body["metadata"]["name"], e)
-            rec.update(state="queued", reason="ApiError", message=str(e)[:300])
+            self._queue(rec, "ApiError", str(e)[:300])
             return
         if not created:
             log.info("%s already exists; treating as created", body["metadata"]["name"])
@@ -1113,6 +1215,11 @@ class Daemon:
                    mem_request=fmt_mem(rmem), job=body["metadata"]["name"], placed=iso(now),
                    pinned=dec["node"] is not None)
         unlink_quiet(os.path.join(self.spool, rec["id"] + ".submit"))
+        name = body["metadata"]["name"]
+        self.pods[name] = {"created": iso(now), "node": dec["node"], "gpus": dec["gpus"], "tasks": [rec["id"]]}
+        self._ended.discard(name)
+        self._event("placed", id=rec["id"], job=name, node=dec["node"], gpus=dec["gpus"], cpu=dec["cpu"],
+                    mem=fmt_mem(dec["mem"]), attempt=rec.get("attempt", 1))
         log.info("placed %s on %s (%d GPU)", rec["id"], dec["node"], dec["gpus"])
 
     def _write_capacity(self, now, cap, nodes_after, queued):
@@ -1144,10 +1251,13 @@ class Daemon:
             log.warning("cannot write capacity: %s", e)
 
     def _gc(self, now):
-        keep = self.cfg["retention_days"] * 86400
-        if keep <= 0:
+        """Hourly: job output after log_retention_days, job dirs after retention_days, event files
+        after event_retention_days. A value <= 0 keeps that kind forever."""
+        self._gc_events(now)
+        keep, log_keep = self.cfg["retention_days"] * 86400, self.cfg["log_retention_days"] * 86400
+        if keep <= 0 and log_keep <= 0:
             return
-        removed = 0
+        removed = trimmed = 0
         for rid in os.listdir(self.jobs_dir):
             d = self._dir(rid)
             if not ID_RE.match(rid) or rid in self.tracked or not is_real_dir(d):
@@ -1164,11 +1274,30 @@ class Daemon:
                     ref = dt.datetime.fromtimestamp(os.lstat(os.path.join(d, "exit")).st_mtime, dt.timezone.utc)
                 except OSError:
                     continue
-            if (now - ref).total_seconds() > keep:
+            age = (now - ref).total_seconds()
+            if keep > 0 and age > keep:
                 shutil.rmtree(d, ignore_errors=True)
                 removed += 1
-        if removed:
-            log.info("gc: removed %d job directories older than %d days", removed, self.cfg["retention_days"])
+            elif log_keep > 0 and age > log_keep and os.path.lexists(os.path.join(d, "log")):
+                for f in ("log", "run.sh"):
+                    unlink_quiet(os.path.join(d, f))
+                trimmed += 1
+        if removed or trimmed:
+            log.info("gc: removed %d job directories, trimmed output of %d jobs", removed, trimmed)
+
+    def _gc_events(self, now):
+        keep = self.cfg["event_retention_days"] * 86400
+        if keep <= 0:
+            return
+        for name in os.listdir(self.events_dir):
+            m = re.match(r"^(\d{4})-(\d{2})\.jsonl$", name)
+            if not m:
+                continue
+            y, mo = int(m.group(1)), int(m.group(2))
+            month_end = dt.datetime(y + mo // 12, mo % 12 + 1, 1, tzinfo=dt.timezone.utc)
+            if (now - month_end).total_seconds() > keep:
+                unlink_quiet(os.path.join(self.events_dir, name))
+                log.info("gc: removed event log %s", name)
 
 
 def main(argv=None):

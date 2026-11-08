@@ -79,6 +79,7 @@ When a GPU job ends, its pod waits about a minute. A queued job with the **same 
 - `gq status <id>` (or `--json`) shows the state, reason, node, GPUs and exit code.
 - `gq logs <id> [-f] [--tail 100]` prints the log. Logs live in `$GQ_ROOT/jobs/<id>/log` (default `~/gq`).
 - `gq ps` shows recent jobs. Add `--json` for machine-readable output.
+- Job output (`log`) is deleted a day after the job ends. Write anything you need to keep to your project directory from the program itself. `gq events --job <id>` keeps gq's record of the job (placement, start, end, exit code) for a year.
 - Exit codes of `gq run` and `gq wait`:
   - The job's own exit code when it ran.
   - **125** when it did not end normally (`rejected`, `expired`, `timeout`, `lost`, `killed`). The reason is printed as JSON on stderr.

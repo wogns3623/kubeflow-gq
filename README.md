@@ -359,6 +359,20 @@ gq capacity --fit 4
 | `GQ_TASK_INDEX`, `GQ_TASK_COUNT` | 배열 작업일 때만 (0부터 시작) |
 | `OMP_NUM_THREADS` | 설정하지 않았다면 `GQ_CPU / GQ_GPUS` |
 
+### 기록 보기: `gq events`
+
+gqd가 한 일을 `<root>/events/YYYY-MM.jsonl`에 1년 동안 남긴다. 작업 출력과 달리 오래 보관한다.
+
+```bash
+gq events                      # 지난 하루
+gq events --since 7d --job 261108-145212-c96c
+gq events --since 30d --json | jq 'select(.event=="pod_ended")'
+```
+
+- **작업:** `submitted` → `queued`(사유가 바뀔 때만) → `placed` 또는 `handoff` → `started` → `finished`(상태, 종료 코드, 실행·대기 시간). 재배치는 `requeued`.
+- **pod:** `pod_idle`(이어 받기 대기), `pod_released`(반납), `pod_ended`(pod가 산 시간, 그 pod에서 돈 작업 목록).
+- 작업 출력은 하루 뒤 지워지고(`gq logs`가 알려 준다), 작업 상태는 30일 뒤 지워지지만 이벤트 로그에는 남는다.
+
 ### 상태
 
 ```
@@ -402,7 +416,9 @@ submitted → queued → pending → running → succeeded / failed
 | `max_array` | 64 | 배열 task 수 |
 | `requests` | 1코어 / 4Gi | 모든 Job의 request |
 | `reuse_grace` | 60 | 끝난 GPU pod가 이어 받을 작업을 기다리는 초. 0이면 끄고, 300을 넘으면 설정 오류다. 노트북의 에이전트는 바꿀 수 없다 |
-| `retention_days` | 30 | `<root>/jobs/<id>/`를 보관하는 기간 |
+| `log_retention_days` | 1 | 작업 출력(`log`)과 `run.sh`를 보관하는 기간(일). 출력을 남겨야 하면 프로그램이 직접 기록한다 |
+| `retention_days` | 30 | `<root>/jobs/<id>/`(요청, 상태)를 보관하는 기간 |
+| `event_retention_days` | 365 | 이벤트 로그(`gq events`)를 보관하는 기간 |
 
 설정을 바꾼 뒤에는 `./gqctl up`으로 반영한다.
 

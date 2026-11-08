@@ -9,6 +9,7 @@ import copy
 import datetime as dt
 import importlib.machinery
 import importlib.util
+import glob
 import io
 import json
 import os
@@ -853,6 +854,48 @@ def test_reuse_end_to_end():
         d.loop_once()
         sg = status(g)
         assert sg["reason"] in ("HandoffFailed", "Created") and sg["attempt"] == 2 and not sg.get("reused")
+
+        # the event log tells the whole story, including how long each pod lived and what ran in it
+        evs = [json.loads(l) for f in sorted(glob.glob(os.path.join(os.environ["GQ_ROOT"], "events", "*.jsonl")))
+               for l in open(f)]
+        of = lambda rid: [e["event"] for e in evs if e.get("id") == rid]
+        assert of(a) == ["submitted", "placed", "started", "finished"]
+        assert of(b) == ["submitted", "queued", "handoff", "started", "finished"]
+        assert of(g)[:3] == ["submitted", "handoff", "requeued"]
+        ended = {e["job"]: e for e in evs if e["event"] == "pod_ended"}
+        assert ended[job_a]["tasks"] == [a, b] and ended[job_a]["outcome"] == "Deleted"
+        assert ended[job_f]["tasks"] == [f, g] and ended[job_f]["outcome"] == "Complete"
+        assert any(e["event"] == "pod_released" and e["job"] == job_a for e in evs)
+        code, out, _ = run_gq("events", "--job", job_a)
+        assert code == 0 and "pod_ended" in out and "lived" in out and "takes over the pod of " + a in out
+        # a restarted gqd does not log the same pod_ended twice
+        d2 = gqd.Daemon(c, os.environ["GQ_ROOT"], kube, clock=clock)
+        d2.loop_once()
+        again = [l for f in glob.glob(os.path.join(os.environ["GQ_ROOT"], "events", "*.jsonl")) for l in open(f)
+                 if '"pod_ended"' in l and job_f in l]
+        assert len(again) == 1
+
+
+def test_retention():
+    with sandbox() as home:
+        c = cfg(volumes=[{"pvc": "ws", "mountPath": home}], root=home + "/gq")
+        clock = Clock()
+        d = gqd.Daemon(c, os.environ["GQ_ROOT"], FakeKube(), clock=clock)
+        rid = json.loads(run_gq("submit", "--local", "--time", "1m", "--", "true")[1])["id"]
+        run_gq("wait", rid, "--timeout", "30s")
+        jd = os.path.join(os.environ["GQ_ROOT"], "jobs", rid)
+        old = os.path.join(os.environ["GQ_ROOT"], "events", "2025-01.jsonl")
+        open(old, "w").write("{}\n")
+        clock.advance(2 * 86400)                                     # past log_retention_days (1)
+        d._gc(clock())
+        assert not os.path.exists(os.path.join(jd, "log")) and not os.path.exists(os.path.join(jd, "run.sh"))
+        assert os.path.exists(os.path.join(jd, "status.json")) and status(rid)["state"] == "succeeded"
+        assert not os.path.exists(old)                               # event files older than a year go
+        code, _, err = run_gq("logs", rid)
+        assert code == 0 and "was removed" in err
+        clock.advance(31 * 86400)                                    # past retention_days (30)
+        d._gc(clock())
+        assert not os.path.exists(jd)
 
 
 def test_local_backend():

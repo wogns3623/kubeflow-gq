@@ -588,11 +588,81 @@ def cmd_wait(a):
 
 def cmd_logs(a):
     ids = expand(a.id)
+    for rid in ids:
+        if not os.path.exists(os.path.join(job_dir(rid), "log")) and load_status(rid).get("state") in TERMINAL:
+            warn("output of %s was removed (job output is kept for log_retention_days, default 1 day); "
+                 "`gq status` and `gq events --job` still have its record" % rid)
     t = Tailer(ids, from_tail=a.tail)
     if a.follow:
         follow(ids, t)
     else:
         t.pump(final=True)
+    return 0
+
+
+def event_detail(e):
+    k = e["event"]
+    if k == "submitted":
+        lo, hi = e.get("gpus") or [0, 0]
+        d = "gpus %s · time %s" % (lo if lo == hi else "%d-%d" % (lo, hi), fmt_dur(e.get("time")))
+        return d + (" · after " + ",".join(e["after"]) if e.get("after") else "")
+    if k in ("queued", "requeued", "pod_released"):
+        return "%s: %s" % (e.get("reason"), e.get("message") or "")
+    if k == "placed":
+        return "%s · %s GPU · attempt %s" % (e.get("job"), e.get("gpus"), e.get("attempt"))
+    if k == "started":
+        return "reused pod %s" % e.get("job") if e.get("reused") else ""
+    if k == "handoff":
+        return "takes over the pod of %s (%s)" % (e.get("after"), e.get("job"))
+    if k == "finished":
+        d = e["state"] + ("" if e.get("exit_code") is None else " exit %s" % e["exit_code"])
+        d += " · ran %s · waited %s" % (fmt_dur(e.get("ran_seconds")), fmt_dur(e.get("waited_seconds")))
+        return d + (" · %s" % e["reason"] if e.get("reason") and e["state"] != "succeeded" else "")
+    if k == "pod_idle":
+        return "after %s · waits %ss for a takeover" % (e.get("after"), e.get("grace"))
+    if k == "pod_ended":
+        return "%s · %s GPU · lived %s · %d job(s) %s" % (e.get("outcome"), e.get("gpus"), fmt_dur(e.get("seconds")),
+                                                       len(e.get("tasks") or []), ",".join(e.get("tasks") or []))
+    return ""
+
+
+def cmd_events(a):
+    since = now_utc() - dt.timedelta(seconds=parse_duration(a.since))
+    months, m = [], since.replace(day=1)
+    while m <= now_utc():
+        months.append(m.strftime("%Y-%m"))
+        m = (m + dt.timedelta(days=32)).replace(day=1)
+    out = []
+    for month in months:
+        try:
+            f = open(os.path.join(root(), "events", month + ".jsonl"), errors="replace")
+        except FileNotFoundError:
+            continue
+        with f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if (parse_ts(e.get("ts")) or since) < since:
+                    continue
+                if a.job and not any(a.job in str(e.get(k) or "") for k in ("id", "job", "after", "tasks")):
+                    continue
+                out.append(e)
+    if a.json:
+        for e in out:
+            print(json.dumps(e, sort_keys=True))
+        return 0
+    if not out:
+        print("(no events since %s)" % iso(since))
+        return 0
+    rows = [["TIME (UTC)", "EVENT", "ID / JOB", "NODE", "DETAIL"]]
+    for e in out:
+        rows.append([e["ts"][5:].replace("T", " ").rstrip("Z"), e["event"], e.get("id") or e.get("job") or "-",
+                     e.get("node") or "-", event_detail(e)])
+    widths = [max(len(r[i]) for r in rows) for i in range(4)]
+    for r in rows:
+        print("  ".join(c.ljust(widths[i]) for i, c in enumerate(r[:4])) + "  " + r[4])
     return 0
 
 
@@ -759,6 +829,10 @@ def build_parser():
     p.add_argument("--mine", action="store_true", help="only jobs with my owner ($GQ_OWNER)")
     p = sub.add_parser("kill", help="stop a job or array group")
     p.add_argument("id")
+    p = sub.add_parser("events", help="gq's own record: submits, placements, handoffs, pod lifetimes")
+    p.add_argument("--since", default="1d", help="how far back (default 1d), e.g. 6h, 7d, 90d")
+    p.add_argument("--job", metavar="ID", help="only events of this job id, group id or Job name")
+    p.add_argument("--json", action="store_true", help="raw JSON lines")
     p = sub.add_parser("capacity", help="free resources per node (estimated by gqd)")
     p.add_argument("--json", action="store_true")
     p.add_argument("--fit", type=int, metavar="N", help="exit 0 if a node has N free GPUs now, else 1")
@@ -766,7 +840,7 @@ def build_parser():
 
 
 COMMANDS = {"submit": cmd_submit, "run": cmd_run, "status": cmd_status, "wait": cmd_wait, "logs": cmd_logs,
-            "ps": cmd_ps, "kill": cmd_kill, "capacity": cmd_capacity}
+            "ps": cmd_ps, "kill": cmd_kill, "capacity": cmd_capacity, "events": cmd_events}
 
 
 def main(argv=None):

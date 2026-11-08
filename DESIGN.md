@@ -361,8 +361,10 @@ Job spec에 들어가는 것은 ID, 이름, owner, 자원, 노드, 배열 index�
 ### 5.11 보존과 정리
 
 - **k8s Job:** 끝나고 1시간 뒤 ttl로 사라진다. 상태는 그 전에 `status.json`에 확정된다.
-- **`jobs/<id>/`:** 종료 후 `retention_days`(30일)가 지나면 gqd가 삭제한다. 삭제 대상은 ID 정규식에 맞는 디렉터리뿐이고, symlink는 따라가지 않는다.
-- 로그를 오래 남겨야 하는 작업이라면, 사용자 코드가 결과를 자기 프로젝트 디렉터리에 쓰도록 한다.
+- **작업 출력:** `log`와 `run.sh`는 종료 후 `log_retention_days`(1일)가 지나면 지운다. `run.sh`에는 제출한 셸의 환경변수(토큰일 수 있음)가 들어 있어서 오래 두지 않는다. 출력을 남겨야 하는 작업은 프로그램이 직접 자기 프로젝트 디렉터리에 기록한다.
+- **`jobs/<id>/`:** 종료 후 `retention_days`(30일)가 지나면 디렉터리째 지운다. 삭제 대상은 ID 정규식에 맞는 디렉터리뿐이고, symlink는 따라가지 않는다. 길게 두지 않는 이유는 `gq ps`가 디렉터리마다 `status.json`을 읽기 때문이다. 오래된 기록은 이벤트 로그(16장)에 있다.
+- **이벤트 로그:** `event_retention_days`(365일). 월별 파일 단위로 지운다.
+- 셋 다 0 이하로 두면 그 종류는 지우지 않는다.
 
 ### 5.12 장애 시나리오
 
@@ -751,3 +753,24 @@ Job 컨테이너의 명령은 gqd가 만든 bash worker다(코드는 ConfigMap�
 
 - `capacity.json`에 유휴 pod 목록(`idle_pods`: job, node, gpus, 유휴 시간)을 넣고 `gq ps` 머리줄에 개수를 보인다.
 - 이어 받은 작업은 `gq ps`의 REASON에 `reused pod (held 2h)`처럼 그 pod가 GPU를 쥔 시간을 보인다.
+
+## 16. 이벤트 로그
+
+목표: 작업 출력과 별개로, **gq 자체가 한 일**을 오래 남긴다. 언제 제출됐고, 어디에 배치됐고, pod가 언제 생기고 사라졌고, 얼마나 유지됐고, 그 pod에서 어떤 작업들이 돌았는지.
+
+- **위치와 형식:** `<root>/events/YYYY-MM.jsonl`. 한 줄에 JSON 이벤트 하나이고, 모든 줄에 `ts`(UTC)와 `event`가 있다. gqd만 append로 쓴다(`O_APPEND`, `O_NOFOLLOW`). 한 줄이 100~300바이트라 지금 쓰는 양이면 한 달에 1MB 안팎이다.
+- **작업 이벤트** (`id` 있음):
+
+  | event | 언제 | 주요 필드 |
+  |---|---|---|
+  | `submitted` | gqd가 요청을 처음 읽을 때 | name, owner, gpus, time, after, group, submitted |
+  | `queued` | 대기 사유가 **바뀔 때만** | reason, message |
+  | `placed` | Job을 만들 때 | job, node, gpus, cpu, mem, attempt |
+  | `handoff` | 유휴 pod를 이어 받을 때 | job, node, gpus, after(앞 작업) |
+  | `started` | running이 될 때 | job, node, started, reused |
+  | `requeued` | 재배치 또는 이어 받기 실패 | reason, job(이전 Job) |
+  | `finished` | 종료 상태가 될 때(거부·만료·kill 포함) | state, reason, exit_code, job, node, gpus, ran_seconds, waited_seconds |
+
+- **pod 이벤트** (`job` 있음): `pod_idle`(작업이 끝나고 이어 받기를 기다림), `pod_released`(대기 작업이 막혀서 유휴 pod를 반납), `pod_ended`(Job이 완료/실패하거나 사라짐: created, ended, seconds, tasks, outcome). pod 생성 시각은 `placed`와 `pod_ended.created`에 있다.
+- **재시작:** `pod_ended`는 Job마다 한 번만 쓴다. gqd가 시작할 때 이번 달과 지난달 파일에서 이미 쓴 것을 읽어 중복을 막는다. 재시작 전부터 있던 Job도 끝나면 기록한다(그 pod에서 돈 작업 목록은 아는 만큼만). gqd가 꺼져 있는 동안 끝나고 TTL(1시간)까지 지나 사라진 Job은 빠진다.
+- **보기:** `gq events [--since 7d] [--job ID|그룹|Job 이름] [--json]`.
