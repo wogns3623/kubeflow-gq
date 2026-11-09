@@ -606,7 +606,9 @@ def event_detail(e):
         lo, hi = e.get("gpus") or [0, 0]
         d = "gpus %s · time %s" % (lo if lo == hi else "%d-%d" % (lo, hi), fmt_dur(e.get("time")))
         return d + (" · after " + ",".join(e["after"]) if e.get("after") else "")
-    if k in ("queued", "requeued", "pod_released"):
+    if k == "pod_released":
+        return e.get("reason") or ""
+    if k in ("queued", "requeued"):
         return "%s: %s" % (e.get("reason"), e.get("message") or "")
     if k == "placed":
         return "%s · %s GPU · attempt %s" % (e.get("job"), e.get("gpus"), e.get("attempt"))
