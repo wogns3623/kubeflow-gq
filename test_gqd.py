@@ -754,6 +754,36 @@ def test_worker_script():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_worker_cleanup_as_pid1():
+    """As the pod's PID 1 the worker kills what a job left running before the next job starts.
+    Needs bash as PID 1, so it runs in a container; skipped without docker and a local debian image."""
+    image = "debian:stable-slim"
+    if subprocess.run(["docker", "image", "inspect", image], capture_output=True).returncode:
+        print("    skipped: needs docker and %s" % image)
+        return
+    tmp = tempfile.mkdtemp()
+    try:
+        a, b = "261109-100000-aaaa", "261109-100001-bbbb"
+        for rid, body in ((a, "sleep 300 & setsid sleep 300 & nohup sleep 300 >/dev/null 2>&1 &\n"
+                              "bash -c 'trap \"\" TERM; sleep 300' &"),
+                          (b, "ls /proc | grep -cE '^[0-9]+$'")):
+            os.makedirs(os.path.join(tmp, "jobs", rid))
+            open(os.path.join(tmp, "jobs", rid, "run.sh"), "w").write(body + "\n")
+        w = subprocess.Popen(["docker", "run", "--rm", "-e", "GQ_ID=" + a, "-v", tmp + ":/r", image,
+                              "bash", "-c", gqd.WORKER % {"root": "/r", "grace": 5}])
+        end = time.monotonic() + 60
+        while not os.path.exists(os.path.join(tmp, "jobs", a, "exit")) and time.monotonic() < end:
+            time.sleep(0.1)
+        fd = os.open(os.path.join(tmp, "jobs", a, "next"), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        os.write(fd, (b + "\n").encode())
+        os.close(fd)
+        assert w.wait(timeout=60) == 0
+        # B sees PID 1, its own bash, ls and grep: none of A's four sleeps survived
+        assert open(os.path.join(tmp, "jobs", b, "log")).read().strip() == "4"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_reuse_rules():
     c = cfg(max_gpus_total=2)
     idle = [{"job": "gq-t-x-a1", "rid": "x", "node": "n-a", "gpus": 1, "cpu": 15.0, "mem": 245 * 2**30}]

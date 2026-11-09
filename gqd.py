@@ -551,8 +551,17 @@ while :; do
   d=$root/jobs/$id
   date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ >"$d/started"
   bash "$d/run.sh" >"$d/log" 2>&1; rc=$?
+  g=$grace
+  if [ $$ -eq 1 ]; then  # pod's PID 1: kill what the job left running so the next job gets a clean GPU
+    kill -9 -1 2>/dev/null
+    for ((i = 0; i < 50; i++)); do
+      left=; set +f; for p in /proc/[0-9]*; do [ "${p#/proc/}" = 1 ] || left=1; done; set -f
+      [ -z "$left" ] && break; sleep 0.1
+    done
+    [ -z "$left" ] || g=0  # something would not die: end the pod instead of handing it over
+  fi
   echo $rc >"$d/exit"
-  [ "$grace" -gt 0 ] || exit $rc
+  [ "$g" -gt 0 ] || exit $rc
   end=$((SECONDS + grace)); line=
   while :; do
     if [ -s "$d/next" ] || { [ $SECONDS -ge $end ] && ! (set -C; echo closed >"$d/next") 2>/dev/null; }; then
