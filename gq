@@ -860,4 +860,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `gq ps | head` ends quietly like other CLIs
     sys.exit(main())
