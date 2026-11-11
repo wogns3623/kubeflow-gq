@@ -420,7 +420,15 @@ submitted → queued → pending → running → succeeded / failed
 | `retention_days` | 30 | `<root>/jobs/<id>/`(요청, 상태)를 보관하는 기간 |
 | `event_retention_days` | 365 | 이벤트 로그(`gq events`)를 보관하는 기간 |
 
-설정을 바꾼 뒤에는 `./gqctl up`으로 반영한다.
+값 하나를 바꿀 때는 `gqctl set`을 쓴다. 파일을 고치고, gqd와 같은 검사를 거친 뒤 바로 배포한다. 검사에서 걸리면 파일도 바꾸지 않는다.
+
+```bash
+./gqctl set max_gpus_total=8 max_running=12   # 바꾸고 배포
+./gqctl set                                   # 지금 값 보기 (default 표시는 파일에 없어 기본값을 쓰는 것)
+./gqctl set reuse_grace=30 --no-up            # 파일만 고치고 배포는 나중에 `./gqctl up`
+```
+
+숫자 항목에는 0 이상의 숫자만, 나머지는 원래 값과 같은 종류만 받는다. `instance`와 `namespace`는 바꾸면 예전 gqd가 남으므로 `set`으로 바꿀 수 없다. 파일을 직접 고친 뒤 `./gqctl down`, `./gqctl up` 순서로 한다. 파일을 직접 고쳤을 때도 `./gqctl up`으로 반영한다.
 
 ## MLXP에서 쓸 때
 
@@ -459,6 +467,7 @@ MLXP(여러 사용자가 쓰는 Kubeflow 기반 GPU 플랫폼)에서는 `gqctl i
 
 | 할 일 | 명령 (노트북 PC) |
 |---|---|
+| 설정 값 바꾸기 | `./gqctl set KEY=VALUE ...` |
 | 설정·코드 변경 반영 | `./gqctl up` |
 | CLI·스킬 갱신 | `./gqctl install --notebook <running-nb>` |
 | 상태 보기 (pod, Job, 최근 로그) | `./gqctl status` |

@@ -701,6 +701,27 @@ def test_gqctl_notebook_side_scripts():
     assert gqctl.locked(nbs) == ["alice-gpu"]
 
 
+def test_gqctl_set():
+    """`gqctl set` changes only the named keys, and a value gqd would refuse never reaches the file."""
+    tmp = tempfile.mkdtemp()
+    try:
+        path = os.path.join(tmp, "c.json")
+        shutil.copy(os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples", "config.mlxp.json"), path)
+        before = json.load(open(path))
+        run = lambda *args: gqctl.main(["--config", path, "set", *args, "--no-up"])
+        assert run("max_gpus_total=8", "reuse_grace=30") == 0
+        after = json.load(open(path))
+        assert after.pop("max_gpus_total") == 8 and after.pop("reuse_grace") == 30
+        before.pop("max_gpus_total", None)
+        assert after == before
+        for bad in ("max_gpus_total=-1", "max_gpus_total=x", "max_gpus_total=1.5", "reuse_grace=301",
+                    "nope=1", "instance=other", "max_gpus_total"):
+            assert run(bad) == 1, bad
+        assert json.load(open(path))["max_gpus_total"] == 8 and os.listdir(tmp) == ["c.json"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_completion():
     """Generated bash completion: subcommands, per-subcommand options, job ids, value options."""
     tmp = tempfile.mkdtemp()

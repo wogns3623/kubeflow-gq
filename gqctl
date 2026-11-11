@@ -540,6 +540,58 @@ def cmd_install(a):
     return 0
 
 
+FIXED_KEYS = ("instance", "namespace")  # renaming would leave the old gqd running; edit the file, down, up
+
+
+def cmd_set(a):
+    """Change top-level config values in the file, check them like gqd does, then deploy."""
+    load(a.config)
+    with open(a.config) as f:
+        cur = json.load(f)
+    known = dict(gqd.DEFAULTS, **cur)
+    if not a.pairs:
+        for k in sorted(known):
+            if not isinstance(known[k], (dict, list)):
+                print("%-24s %s%s" % (k, json.dumps(known[k]), "" if k in cur else "  (default)"))
+        return 0
+    new = dict(cur)
+    for pair in a.pairs:
+        k, eq, raw = pair.partition("=")
+        if not eq:
+            raise Fail("expected KEY=VALUE, got %r" % pair)
+        if k not in known:
+            raise Fail("unknown setting %r; `gqctl set` lists them" % k)
+        if k in FIXED_KEYS:
+            raise Fail("%s cannot be changed here: edit %s, then `gqctl down` and `gqctl up`" % (k, a.config))
+        try:
+            v = json.loads(raw)
+        except ValueError:
+            v = raw
+        old = known[k]
+        num = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)
+        if num(old):
+            ok = num(v) and v >= 0 and (isinstance(v, int) or isinstance(old, float))
+        else:
+            ok = old is None or type(v) is type(old)
+        if not ok:
+            raise Fail("%s: expected a value like %s, got %s" % (k, json.dumps(old), json.dumps(v)))
+        new[k] = v
+    tmp = a.config + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(new, f, indent=2)
+        f.write("\n")
+    try:
+        gqd.load_config(tmp)
+    except (ValueError, KeyError, TypeError) as e:
+        os.unlink(tmp)
+        raise Fail("not saved: %s" % e)
+    os.replace(tmp, a.config)
+    for k in new:
+        if new[k] != known[k]:
+            print("%s: %s -> %s" % (k, json.dumps(known[k]), json.dumps(new[k])))
+    return 0 if a.no_up else cmd_up(a)
+
+
 def cmd_up(a):
     cfg = load(a.config)
     n, ns = names(cfg), cfg["namespace"]
@@ -770,6 +822,10 @@ def build_parser():
     p.add_argument("--no-claude-settings", action="store_true",
                    help="do not add allow gq / deny kubectl to ~/.claude/settings.json")
     sub.add_parser("up", help="deploy or update gqd")
+    p = sub.add_parser("set", help="change settings and deploy, e.g. `gqctl set max_gpus_total=8`; "
+                                   "no arguments lists them")
+    p.add_argument("pairs", nargs="*", metavar="KEY=VALUE")
+    p.add_argument("--no-up", action="store_true", help="only save the file; deploy later with `gqctl up`")
     sub.add_parser("status", help="gqd pod, gq Jobs and recent logs")
     p = sub.add_parser("logs", help="gqd logs")
     p.add_argument("-f", "--follow", action="store_true")
@@ -810,7 +866,7 @@ def build_parser():
 def main(argv=None):
     a = build_parser().parse_args(argv)
     try:
-        return {"init": cmd_init, "render": cmd_render, "probe": cmd_probe, "install": cmd_install, "up": cmd_up,
+        return {"init": cmd_init, "render": cmd_render, "probe": cmd_probe, "install": cmd_install, "up": cmd_up, "set": cmd_set,
                 "status": cmd_status, "logs": cmd_logs, "lockdown": cmd_lockdown,
                 "unlock": lambda a: cmd_lockdown(a, undo=True), "setup": cmd_setup, "down": cmd_down,
                 "completion": cmd_completion}[a.command](a)
