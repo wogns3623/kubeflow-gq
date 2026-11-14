@@ -285,7 +285,7 @@ gq kill <id>                                             # 중지 (배열 그룹
 | `--gpus` | `0` | `N` 또는 `LO-HI`. 범위를 주면 지금 한 노드에서 줄 수 있는 만큼 받는다 |
 | `--array N` | | 같은 명령을 N개 task로 돌린다. 각 task는 독립적으로 배치된다 |
 | `--cpu`, `--mem` | GPU 1장당 노드 한도/GPU 수, CPU 작업은 8코어/64Gi | **limit**이다. request는 항상 작게(1코어/4Gi) 잡는다 |
-| `--wait-timeout` | `6h` | 제출부터 시작까지 기다리는 최대 시간. 넘으면 `expired` |
+| `--wait-timeout` | 없음 | 이 시간 안에 시작하지 못하면 포기한다(`expired`). 주지 않으면 시작하거나 kill될 때까지 기다린다. 얼마나 기다릴지는 보통 `gq wait --timeout`으로 정한다 |
 | `--name` | | 짧은 라벨 (`[A-Za-z0-9._-]`, 63자 이하). 네임스페이스에 보이므로 비밀을 넣지 않는다 |
 | `--local` | | pod 대신 지금 이 노트북에서 실행한다 (CPU 작업 전용, gqd 불필요) |
 | `--env K=V` / `--clean-env` | | 환경변수 추가·덮어쓰기 / 환경 전달 끄기 |
@@ -388,7 +388,7 @@ submitted → queued → pending → running → succeeded / failed
 | `running` | 실행 중 |
 | `succeeded` / `failed` | exit 0 / 그 외. `failed`의 reason이 `OOMKilled`면 메모리 부족이다 |
 | `timeout` | `--time`을 넘겨서 중지됐다 |
-| `expired` | `--wait-timeout` 안에 시작하지 못했다 |
+| `expired` | 지정한 `--wait-timeout` 안에 시작하지 못했다 |
 | `lost` | exit code 없이 pod가 사라졌다 (축출, 노드 장애, 노트북 재시작 시 `--local` 작업) |
 | `killed` | `gq kill`로 중지했다 |
 | `rejected` | 요청이 유효하지 않거나(`Invalid`) 대기열이 가득 찼다(`QueueFull`) |
@@ -496,7 +496,7 @@ gqd가 돌고 있지 않다는 뜻이다. `./gqctl status`로 확인한다.
 
 ### `queued` (`NoFit`)가 오래감
 
-들어갈 노드가 없다는 뜻이다. `gq capacity`로 확인하고 [단편화를 고려해 나누기](#단편화를-고려해-나누기)처럼 쪼개거나, `--wait-timeout`을 넉넉히 두고 기다린다.
+들어갈 노드가 없다는 뜻이다. `gq capacity`로 확인하고 [단편화를 고려해 나누기](#단편화를-고려해-나누기)처럼 쪼개거나, 그대로 기다린다. 작업은 시작할 때까지 대기열에 남는다.
 
 ### `queued` (`Cap`)
 

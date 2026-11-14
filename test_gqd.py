@@ -83,13 +83,14 @@ def test_validate():
     ok = gqd.validate(req(gpus=(1, 4), mem="64Gi", cwd="/home/irteam/p/../q"), c)
     assert ok["gpus"] == [1, 4] and ok["mem"] == 64 * 2**30 and ok["cwd"] == "/home/irteam/q"
     assert gqd.validate(dict(req(), gpus=2), c)["gpus"] == [2, 2]
+    assert gqd.validate(req(wait_timeout=None), c)["wait_timeout"] is None   # no deadline: waits until it starts
     bad = [
         dict(req(), extra=1),                                   # unknown field
         req(rid="../../etc"),                                   # path injection via id
         req(cwd="/etc"), req(cwd="/home/irteam/../etc"),        # cwd outside the mounted volumes
         req(cwd="relative/path"), req(cwd="/home/irteamX"),
         req(gpus=(2, 1)), req(gpus=(0, 2)), req(gpus=(1, 9)),   # bad GPU ranges
-        req(time=10**9), req(wait_timeout=0), req(time=True),   # limits / bool is not a number
+        req(time=10**9), req(wait_timeout=0), req(wait_timeout="6h"), req(time=True),   # limits / bool is not a number
         req(cpu=500), req(mem="9Ti"), req(mem="lots"),          # over node size / garbage
         req(backend="local"), req(name="has space"), req(owner="x" * 64),
         req(rid="261108-061530-a1b2-1", group="261108-061530-ffff", task_index=1, task_count=2),
@@ -478,6 +479,15 @@ def test_end_to_end():
         clock.advance(400)  # submitted uses the real clock; the fake clock is far ahead after this
         d2.loop_once()
         assert status(rid_w)["state"] == "expired"
+        # Without --wait-timeout it waits as long as it takes.
+        rid_n = json.loads(run_gq("submit", "--gpus", "8", "--time", "1h", "--", "true")[1])["id"]
+        d2.loop_once()
+        clock.advance(30 * 86400)
+        d2.loop_once()
+        assert status(rid_n)["state"] == "queued" and json.load(open(os.path.join(
+            os.environ["GQ_ROOT"], "jobs", rid_n, "request.json")))["wait_timeout"] is None
+        run_gq("kill", rid_n)
+        d2.loop_once()
 
         # A second user's gqd in the same namespace: its unbound Job reserves capacity for us,
         # and neither instance ever deletes the other's Jobs (FakeKube asserts that).
@@ -885,7 +895,7 @@ def test_reuse_end_to_end():
         d.loop_once()
         kube.run(status(e)["job"], status(e)["node"])
         d.loop_once()
-        f = sub("--gpus", "1", "--after", e)
+        f = sub("--gpus", "1", "--after", e, "--wait-timeout", "6h")
         d.loop_once()
         d.tracked[f]["submitted"] = gqd.iso(clock() - dt.timedelta(hours=7))  # as if E ran 7h: past f's --wait-timeout (6h)
         put(e, "next", "closed\n")

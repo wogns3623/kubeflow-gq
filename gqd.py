@@ -304,10 +304,11 @@ def validate(req, cfg):
             raise Invalid("mem: must be in (0, %s]" % fmt_mem(cfg["_node"]["mem"]))
     out.update(cpu=cpu, mem=mem)
 
-    t, w = num("time"), num("wait_timeout")
+    t = num("time")
+    w = None if req.get("wait_timeout") is None else num("wait_timeout")  # None: wait until it starts or is killed
     if not 1 <= t <= cfg["max_time"]:
         raise Invalid("time: must be in [1, %d] seconds" % cfg["max_time"])
-    if not 1 <= w <= cfg["max_wait_timeout"]:
+    if w is not None and not 1 <= w <= cfg["max_wait_timeout"]:
         raise Invalid("wait_timeout: must be in [1, %d] seconds" % cfg["max_wait_timeout"])
     out.update(time=t, wait_timeout=w)
 
@@ -1079,7 +1080,7 @@ class Daemon:
         if rec["state"] == "running" and started and (now - started).total_seconds() > rec["time"]:
             self.kube.delete_job(rec["job"])
             self._finish(rec, "timeout", "TimeLimit", "ran longer than --time (%ds)" % rec["time"], now)
-        elif rec["state"] == "pending" and (now - waiting_since).total_seconds() > rec["wait_timeout"]:
+        elif rec["state"] == "pending" and rec["wait_timeout"] and (now - waiting_since).total_seconds() > rec["wait_timeout"]:
             self.kube.delete_job(rec["job"])
             self._finish(rec, "expired", "WaitTimeout",
                          "did not start within --wait-timeout (%ds)" % rec["wait_timeout"], now)
@@ -1197,7 +1198,7 @@ class Daemon:
                 continue
             if rec["_req"].get("after") and not rec.get("ready"):
                 rec["ready"] = iso(now)  # --wait-timeout counts from here
-            if (now - parse_ts(rec.get("ready") or rec["submitted"])).total_seconds() > rec["wait_timeout"]:
+            if rec["wait_timeout"] and (now - parse_ts(rec.get("ready") or rec["submitted"])).total_seconds() > rec["wait_timeout"]:
                 unlink_quiet(os.path.join(self.spool, rid + ".submit"))
                 self._finish(rec, "expired", "WaitTimeout",
                              "did not start within --wait-timeout (%ds); last: %s"

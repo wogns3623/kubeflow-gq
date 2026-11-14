@@ -475,7 +475,7 @@ def cmd_submit(a, follow_logs=False):
         raise Usage("--local runs on this machine and cannot take --gpus")
     if a.array is not None and not 1 <= a.array <= 999:
         raise Usage("--array must be in [1, 999]")
-    seconds, wait_s = parse_duration(a.time), parse_duration(a.wait_timeout)
+    seconds, wait_s = parse_duration(a.time), (parse_duration(a.wait_timeout) if a.wait_timeout else None)
     if not NAME_RE.match(a.name):
         raise Usage("--name: up to 63 characters of [A-Za-z0-9._-]")
     if a.mem is not None and not MEM_RE.match(a.mem):
@@ -803,7 +803,7 @@ def build_parser():
                                                   "the request stays small (1 core)")
         p.add_argument("--mem", help="memory limit, e.g. 64Gi (default: 245Gi per GPU, 64Gi for CPU jobs); "
                                      "the request stays small (4Gi)")
-        p.add_argument("--wait-timeout", default="6h", help="max time from submit to start (default 6h)")
+        p.add_argument("--wait-timeout", help="give up if not started within this time (default: wait until it starts)")
         p.add_argument("--name", default="", help="short label, visible to the namespace; no secrets")
         p.add_argument("--local", action="store_true", help="run on this machine instead of a pod")
         p.add_argument("--env", action="append", metavar="K=V", help="set or override an environment variable")

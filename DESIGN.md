@@ -166,7 +166,7 @@ submitted ─┬─▶ rejected
 
 - **함정:** `activeDeadlineSeconds`는 Job이 생성된 시점부터 센다. 그래서 Pending으로 기다리는 시간도 `--time`에서 깎인다.
 - **실행 시간:** gqd가 main 컨테이너의 `startedAt`부터 직접 재고, 넘으면 Job을 삭제한 뒤 `timeout`으로 기록한다.
-- **대기 시간:** `wait_timeout`(기본 6h, 최대 24h)은 제출부터 시작까지, 즉 `queued`와 `pending`을 합친 시간이다. 넘으면 Job이 있으면 삭제하고 `expired`로 기록한다.
+- **대기 시간:** 기본으로는 상한이 없다. 돌리기로 한 작업은 언제 시작하든 돌린다. 얼마나 기다릴지는 클라이언트(`gq wait --timeout`)가 정하고, 지나도 작업은 그대로 둔다. 늦게 시작하면 소용없는 작업만 `wait_timeout`(최대 24h)을 준다. 제출부터 시작까지(`--after`면 앞 작업이 끝난 뒤부터), 즉 `queued`와 `pending`을 합친 시간이며, 넘으면 Job이 있으면 삭제하고 `expired`로 기록한다. 처음에는 기본 6h였으나, 에이전트가 모르는 사이 작업이 사라지는 쪽이 늦게 도는 것보다 나쁘다고 보고 없앴다. 오래된 대기 작업은 `max_queue`가 개수를 묶고, 필요 없어지면 kill한다.
 - **백스톱:** `activeDeadlineSeconds = time + placement_grace + deadline_slack`(기본 30분, 이미지 pull 여유)으로 둔다. Job은 맞는 노드가 있을 때만 만들어지므로 Pending은 짧다. gqd가 죽어 있어도 작업이 무한히 돌지 않는다.
 
 ### 5.5 실행 환경 전달
@@ -241,7 +241,7 @@ gq capacity [--json] [--fit N]     노드별 남은 자원 (5.13)
   --time 4h           필수. 상한 48h
   --cpu C --mem M     limit. 기본: 실제 GPU 1장당 노드 용량/8 (CPU 15, 245Gi). CPU 작업은 8 / 64Gi.
                       request는 항상 작은 고정값(1코어, 4Gi; limit보다 크지 않게)
-  --wait-timeout 6h   제출부터 시작까지. 상한 24h
+  --wait-timeout 6h   이 안에 시작 못 하면 포기(expired). 기본 없음, 상한 24h
   --name X            사람이 읽을 짧은 이름 (Job annotation에 들어가므로 비밀을 넣지 않는다)
   --local             nogpu2에서 직접 실행 (--gpus와 함께 쓸 수 없다)
   --env K=V, --clean-env
@@ -373,7 +373,7 @@ Job spec에 들어가는 것은 ID, 이름, owner, 자원, 노드, 배열 index�
 | gqd 다운 | 새 요청이 `submitted`에 머문다. 실행 중인 작업은 계속 돈다 | Deployment가 재시작한다. gq가 heartbeat 경고를 낸다. 시간 상한은 `activeDeadlineSeconds` 백스톱이 맡는다 |
 | gqd 두 개가 동시에 실행 | 중복 처리 | Deployment `strategy: Recreate`, replicas 1. Job 이름이 고정이라 `AlreadyExists`로 멱등성이 보장된다 |
 | nogpu2 재시작 | 로컬 작업은 `lost`. pod 작업은 영향 없다 | 로컬 작업이 오래 걸리면 pod 백엔드를 쓴다 |
-| GPU 부족 / 단편화 | `queued`(`NoFit`)가 길어진다 | Job을 만들지 않고 기다린다. `wait_timeout`이 지나면 `expired`. 에이전트는 `gq capacity`를 보고 쪼갤지 정한다 |
+| GPU 부족 / 단편화 | `queued`(`NoFit`)가 길어진다 | Job을 만들지 않고 기다린다(`wait_timeout`을 줬다면 지난 뒤 `expired`). 에이전트는 `gq capacity`를 보고 쪼갤지 정한다 |
 | 자원 추정이 틀림 (사람이 노트북을 켬, 보이지 않는 시스템 pod) | Job이 Pending | `placement_grace`(60초) 후 Job을 삭제하고 `queued`로 되돌려 다시 배치한다 |
 | OOM / 축출 / 노드 장애 | `failed`(OOMKilled) / `lost` | 사유를 기록한다. 재시도는 에이전트가 판단한다 (자동 재시도 없음) |
 | PVC 가득 참 | log/exit 쓰기 실패 | `gq ps` 헤더에 남은 용량 표시 |
@@ -463,7 +463,7 @@ total free 4 · max on one node 2 · team-ml GPU waiting 0 · gq 0/4
   1. 독립적으로 나눌 수 있는 작업(평가 shard, 시드, 하이퍼파라미터, 모델별 실행)은 `--array`에 `--gpus 1`(또는 2)로 쪼갠다.
   2. 한 프로그램이 N장을 꼭 써야 하면 `gq capacity --fit N`을 확인한다.
   3. 맞는 노드가 없는데 GPU 수에 맞춰 돌 수 있는 작업이면 `--gpus LO-HI`를 쓴다.
-  4. 그것도 안 되면 제출하고 기다린다. 이때 `--wait-timeout`을 정해 둔다.
+  4. 그것도 안 되면 제출하고 `gq wait --timeout`으로 기다린다. 지나면 상태를 보고 판단한다.
 - CPU 작업은 nogpu2에 여유가 있으면 `--local`로, 크면 pod로 보낸다.
 - `queued` 사유가 `NoFit`이면 기다리는 중이다. `Cap`이면 gq 상한에 걸린 것이므로 자기 작업이 끝나기를 기다린다.
 - `gq ps --mine`으로 자기 작업만 보고, 자기 작업만 kill한다.

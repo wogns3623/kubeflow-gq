@@ -53,7 +53,7 @@ The nodes are shared with other people. **A job runs on one node only.** A 4-GPU
    - Set `--time` for the slowest piece. If they contend for the GPU, each runs slower than alone.
 3. If one program truly needs N GPUs, run `gq capacity --fit N`. Exit 0 means a node has N free now.
 4. If nothing fits now but the program can run on fewer GPUs, use `--gpus LO-HI`.
-5. Otherwise submit and wait. Set `--wait-timeout` (default 6h) to how long you are willing to wait.
+5. Otherwise submit and wait. A submitted job stays queued until it starts, however long that takes; it never expires on its own. `gq wait <id> --timeout 30m` sets how long *you* wait. When it returns 124, check `gq status <id>` and decide: keep waiting, or kill it and submit a smaller version. Add `--wait-timeout` only when a late start would be useless; the job then ends `expired`.
 
 ## Follow-up jobs keep the GPU
 
@@ -71,6 +71,7 @@ When a GPU job ends, its pod waits about a minute. A queued job with the **same 
   - `NoFit`: no node has room. Wait, or split it.
   - `Cap`: the gq limit for this user is reached (`gq capacity` shows `gq used/limit`). Wait for your other jobs.
 - Kill only your own jobs (`gq ps --mine`). Kill jobs you no longer need right away. GPUs are shared.
+- Queued jobs wait indefinitely. If your plan changes or your session ends, kill the queued jobs nobody will use.
 - `--name` is visible to everyone in the namespace. Never put secrets in it.
 - Never use `kubectl`. It has no credentials here.
 
@@ -84,7 +85,7 @@ When a GPU job ends, its pod waits about a minute. A queued job with the **same 
   - The job's own exit code when it ran.
   - **125** when it did not end normally (`rejected`, `expired`, `timeout`, `lost`, `killed`). The reason is printed as JSON on stderr.
   - **124** when `wait --timeout` passed.
-- States: `submitted` → `queued` → `pending` → `running` → `succeeded` / `failed`. Abnormal ends: `timeout`, `expired` (never started within `--wait-timeout`), `lost` (pod vanished, e.g. node failure), `killed`, `rejected` (invalid request).
+- States: `submitted` → `queued` → `pending` → `running` → `succeeded` / `failed`. Abnormal ends: `timeout`, `expired` (not started within the `--wait-timeout` you set), `lost` (pod vanished, e.g. node failure), `killed`, `rejected` (invalid request).
 - `failed` with reason `OOMKilled` means the job ran out of memory. Raise `--mem`.
 - If commands warn that the gqd heartbeat is missing or old, gqd is down. Tell the user; you cannot fix it from here.
 
