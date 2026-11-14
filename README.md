@@ -284,6 +284,7 @@ gq kill <id>                                             # 중지 (배열 그룹
 | `--time` | (필수) | 실행 시간 상한. `90s`, `30m`, `4h`, `1h30m`, `2d` 형식. 넘으면 `timeout` |
 | `--gpus` | `0` | `N` 또는 `LO-HI`. 범위를 주면 지금 한 노드에서 줄 수 있는 만큼 받는다 |
 | `--array N` | | 같은 명령을 N개 task로 돌린다. 각 task는 독립적으로 배치된다 |
+| `--nodes N` | `1` | N개 노드에 `--gpus`장씩 동시에 띄워 하나의 분산 작업으로 돌린다. 아래 "여러 노드에 걸쳐 돌리기" |
 | `--cpu`, `--mem` | GPU 1장당 노드 한도/GPU 수, CPU 작업은 8코어/64Gi | **limit**이다. request는 항상 작게(1코어/4Gi) 잡는다 |
 | `--wait-timeout` | 없음 | 이 시간 안에 시작하지 못하면 포기한다(`expired`). 주지 않으면 시작하거나 kill될 때까지 기다린다. 얼마나 기다릴지는 보통 `gq wait --timeout`으로 정한다 |
 | `--name` | | 짧은 라벨 (`[A-Za-z0-9._-]`, 63자 이하). 네임스페이스에 보이므로 비밀을 넣지 않는다 |
@@ -309,7 +310,7 @@ GPU 작업이 끝나도 pod는 바로 사라지지 않고 **`reuse_grace`초(기
 
 ### 단편화를 고려해 나누기
 
-**한 작업은 한 노드에만 올라간다.** 아래는 H200 8장 × 4대 zone의 예시다.
+**한 작업은 한 노드에만 올라간다** (`--nodes`를 주지 않으면). 아래는 H200 8장 × 4대 zone의 예시다.
 
 ```
 $ gq capacity
@@ -349,6 +350,22 @@ gq capacity --fit 4
   - 노드가 한가하면 limit까지 CPU를 더 쓸 수 있다. 붐비면 몫이 줄고, 노드 메모리가 부족하면 먼저 축출될 수 있다.
   - request 값은 설정의 `requests`에서 바꾼다.
 
+### 여러 노드에 걸쳐 돌리기: `--nodes`
+
+`--nodes N --gpus G`는 서로 다른 노드 N개에 G장씩 pod를 띄워 한 작업으로 돌린다(PyTorchJob). 노드마다 1장씩만 남아 있을 때, 한 노드에 자리가 날 때까지 기다리지 않고 지금 남은 것을 묶어 쓰는 용도다.
+
+```bash
+# 노드 2개 × 1장. torchrun은 인자 없이 rendezvous를 찾는다(PET_* 환경변수)
+gq submit --nodes 2 --gpus 1 --time 4h -- torchrun train.py
+```
+
+- **필요한 것:** 클러스터에 Kubeflow Training Operator가 있고, gqd의 서비스 계정이 `pytorchjobs`를 만들 수 있어야 한다. 노드 간 통신이 InfiniBand를 쓰려면 이미지에 `libibverbs1`, `ibverbs-providers`가 있어야 한다. 없으면 NCCL이 소켓으로 돌아가 수십 배 느리다(`NCCL_DEBUG=INFO`로 `NET/IB`인지 확인).
+- **배치:** G장이 남은 노드 N개가 동시에 있어야 시작한다. 그중 가장 꽉 찬 노드들을 고르고, pod는 모두 함께 뜬다(gang). 모자라면 `NoFit`으로 기다린다.
+- **비용:** 한 노드 안의 NVLink보다 노드 간 통신이 느리다. 한 노드에 G×N장이 날 때까지 기다릴 수 있으면 `--gpus`만 쓰는 편이 빠를 수 있다.
+- **제약:** `--gpus`는 고정값(범위·0 불가)이고, `노드 수 × GPU 수`가 `max_gpus_total`을 넘을 수 없다. pod 이어 받기는 하지 않는다.
+- **실패:** 한 rank라도 0이 아닌 코드로 끝나면 작업 전체가 `failed`이고 나머지 pod는 지운다.
+- **출력:** rank 0은 `log`, rank r은 `log.r`에 쓴다. `gq logs`는 rank 0만 보여 준다.
+
 ### Job 안에서 쓸 수 있는 환경변수
 
 | 변수 | 값 |
@@ -357,6 +374,7 @@ gq capacity --fit 4
 | `GQ_GPUS` | 실제로 배정된 GPU 수 |
 | `GQ_CPU` | CPU limit (코어) |
 | `GQ_TASK_INDEX`, `GQ_TASK_COUNT` | 배열 작업일 때만 (0부터 시작) |
+| `GQ_NODES`, `GQ_NODE_RANK`, `GQ_MASTER_ADDR`, `GQ_MASTER_PORT` | `--nodes`일 때만. torchrun용 `PET_NNODES`, `PET_NODE_RANK`, `PET_NPROC_PER_NODE`, `PET_MASTER_ADDR`, `PET_MASTER_PORT`도 설정된다 |
 | `OMP_NUM_THREADS` | 설정하지 않았다면 `GQ_CPU / GQ_GPUS` |
 
 ### 기록 보기: `gq events`

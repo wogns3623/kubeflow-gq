@@ -473,6 +473,8 @@ def cmd_submit(a, follow_logs=False):
     lo, hi = parse_gpus(a.gpus)
     if a.local and hi:
         raise Usage("--local runs on this machine and cannot take --gpus")
+    if a.nodes != 1 and (a.nodes < 1 or a.local or lo != hi or lo == 0):
+        raise Usage("--nodes N needs a fixed --gpus G > 0 (G GPUs on each of N nodes) and no --local")
     if a.array is not None and not 1 <= a.array <= 999:
         raise Usage("--array must be in [1, 999]")
     seconds, wait_s = parse_duration(a.time), (parse_duration(a.wait_timeout) if a.wait_timeout else None)
@@ -516,6 +518,8 @@ def cmd_submit(a, follow_logs=False):
         req = {"id": rid, "name": a.name, "owner": my_owner(), "backend": backend, "gpus": [lo, hi],
                "cpu": a.cpu, "mem": a.mem, "time": seconds, "wait_timeout": wait_s, "cwd": cwd,
                "submitted": submitted}
+        if a.nodes > 1:
+            req["nodes"] = a.nodes
         if n:
             req.update(group=base, task_index=k, task_count=n)
         if after:
@@ -524,7 +528,7 @@ def cmd_submit(a, follow_logs=False):
         with open(os.path.join(d, "run.sh"), "w") as f:
             f.write(render_run_sh(cwd, cmd, env))
         os.chmod(os.path.join(d, "run.sh"), 0o755)
-        st = {k2: req.get(k2) for k2 in ("id", "group", "task_index", "task_count", "name", "owner", "backend",
+        st = {k2: req.get(k2) for k2 in ("id", "group", "task_index", "task_count", "name", "owner", "backend", "nodes",
                                          "time", "wait_timeout", "cwd", "submitted", "after")}
         st.update(state="submitted", reason=None, message=None, gpus=None, gpus_requested=[lo, hi], node=None,
                   started=None, finished=None, exit_code=None)
@@ -570,6 +574,9 @@ def cmd_status(a):
             if st.get(k) not in (None, ""):
                 print("%-15s %s" % (k + ":", st[k]))
         print("%-15s %s" % ("log:", os.path.join(job_dir(a.id), "log")))
+        if (st.get("nodes") or 1) > 1:
+            print("%-15s %d (ranks 1-%d log to log.1 .. log.%d)" % ("nodes:", st["nodes"], st["nodes"] - 1,
+                                                                    st["nodes"] - 1))
         return 0
     print_table(sts)
     return 0
@@ -618,13 +625,15 @@ def event_detail(e):
     if k == "submitted":
         lo, hi = e.get("gpus") or [0, 0]
         d = "gpus %s · time %s" % (lo if lo == hi else "%d-%d" % (lo, hi), fmt_dur(e.get("time")))
+        d += " · %d nodes" % e["nodes"] if e.get("nodes") else ""
         return d + (" · after " + ",".join(e["after"]) if e.get("after") else "")
     if k == "pod_released":
         return e.get("reason") or ""
     if k in ("queued", "requeued"):
         return "%s: %s" % (e.get("reason"), e.get("message") or "")
     if k == "placed":
-        return "%s · %s GPU · attempt %s" % (e.get("job"), e.get("gpus"), e.get("attempt"))
+        gpus = "%sx%s" % (e["nodes"], e.get("gpus")) if e.get("nodes") else e.get("gpus")
+        return "%s · %s GPU · attempt %s" % (e.get("job"), gpus, e.get("attempt"))
     if k == "started":
         return "reused pod %s" % e.get("job") if e.get("reused") else ""
     if k == "handoff":
@@ -687,6 +696,8 @@ def row(st):
     if gpus is None:
         lo, hi = (st.get("gpus_requested") or [0, 0])
         gpus = ("%d" % lo if lo == hi else "%d-%d" % (lo, hi)) + ("?" if hi else "")
+    if (st.get("nodes") or 1) > 1:
+        gpus = "%dx%s" % (st["nodes"], gpus)
     if state in ("submitted", "queued", "pending"):
         t = "wait " + fmt_dur(age(st.get("submitted")))
     elif state == "running":
@@ -809,7 +820,9 @@ def build_parser():
     sub = ap.add_subparsers(dest="command", required=True)
 
     def job_opts(p):
-        p.add_argument("--gpus", default="0", help="N or LO-HI (default 0 = CPU job)")
+        p.add_argument("--gpus", default="0", help="N or LO-HI (default 0 = CPU job); per node with --nodes")
+        p.add_argument("--nodes", type=int, default=1,
+                       help="run on N nodes at once as one PyTorchJob (torchrun needs no arguments); default 1")
         p.add_argument("--array", type=int, help="run the command as N tasks (GQ_TASK_INDEX/GQ_TASK_COUNT)")
         p.add_argument("--time", required=True, help="run time limit, e.g. 30m, 4h (required)")
         p.add_argument("--cpu", type=float, help="CPU limit in cores (default: 15 per GPU, 8 for CPU jobs); "

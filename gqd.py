@@ -9,6 +9,7 @@ status files. See DESIGN.md (sections 5 and 7). Deployed by gqctl.
     python3 -I gqd.py --config config.json --root /gq [--dry-run] [--once]
 """
 import argparse
+import copy
 import datetime as dt
 import json
 import logging
@@ -30,9 +31,10 @@ INSTANCE_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,14}[a-z0-9])?$")
 TERMINAL = frozenset({"rejected", "expired", "succeeded", "failed", "timeout", "lost", "killed"})
 ACTIVE = frozenset({"pending", "running"})
 REQ_KEYS = frozenset({"id", "group", "task_index", "task_count", "name", "owner", "backend",
-                      "gpus", "cpu", "mem", "time", "wait_timeout", "cwd", "submitted", "after"})
+                      "gpus", "nodes", "cpu", "mem", "time", "wait_timeout", "cwd", "submitted", "after"})
 REUSE_GRACE_MAX = 300  # hard ceiling for reuse_grace; a config above it is an error (DESIGN 15.2)
 MAX_REQ_BYTES = 64 * 1024
+PTJ = ("kubeflow.org", "v1", "pytorchjobs")  # multi-node jobs (DESIGN 17)
 
 REQUIRED = ("instance", "namespace", "image", "volumes", "root")
 DEFAULTS = {
@@ -290,6 +292,18 @@ def validate(req, cfg):
         raise Invalid("gpus: a range cannot start at 0")
     out["gpus"] = [lo, hi]
 
+    n = req.get("nodes", 1)
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise Invalid("nodes: expected a positive integer")
+    if n > 1:
+        if lo != hi or lo == 0:
+            raise Invalid("nodes: a multi-node job needs a fixed GPU count per node (--gpus N, not a range or 0)")
+        if n * lo > cfg["max_gpus_total"]:
+            raise Invalid("nodes x gpus = %d is more than max_gpus_total (%d)" % (n * lo, cfg["max_gpus_total"]))
+        if cfg["nodes"] and n > len(cfg["nodes"]):
+            raise Invalid("nodes: only %d nodes are configured" % len(cfg["nodes"]))
+    out["nodes"] = n
+
     cpu, mem = req.get("cpu"), req.get("mem")
     if cpu is not None:
         cpu = float(num("cpu", (int, float)))
@@ -395,13 +409,23 @@ def job_condition(job, kind):
     return None
 
 
+def job_end(job):
+    """The condition that ended a Job (Complete/Failed) or a PyTorchJob (Succeeded/Failed), or None."""
+    return job_condition(job, "Complete") or job_condition(job, "Succeeded") or job_condition(job, "Failed")
+
+
 def job_finished(job):
-    return bool(job_condition(job, "Complete") or job_condition(job, "Failed"))
+    return job_end(job) is not None
 
 
 def pod_job_name(pod):
     labels = pod["metadata"].get("labels") or {}
-    return labels.get("batch.kubernetes.io/job-name") or labels.get("job-name")
+    return labels.get("batch.kubernetes.io/job-name") or labels.get("job-name") or labels.get("gq-job")
+
+
+def total_gpus(rec):
+    """GPUs a job holds across all its nodes."""
+    return (rec.get("gpus") or 0) * (rec.get("nodes") or 1)
 
 
 def capacity(pods, jobs, cfg, metrics=None):
@@ -413,7 +437,7 @@ def capacity(pods, jobs, cfg, metrics=None):
     n = cfg["_node"]
     nodes = {name: {"gpu_used": 0, "cpu_used": 0.0, "mem_used": 0, "cpu_actual": 0.0}
              for name in cfg["nodes"]}
-    waiting, bound_jobs = 0, set()
+    waiting, bound = 0, set()  # bound: (Job name, node) of gq pods already on a node
     for p in pods:
         phase = (p.get("status") or {}).get("phase")
         if phase in ("Succeeded", "Failed"):
@@ -426,7 +450,7 @@ def capacity(pods, jobs, cfg, metrics=None):
                 waiting += pod_gpus(p)
             continue
         if is_gq:
-            bound_jobs.add(pod_job_name(p))
+            bound.add((pod_job_name(p), node))
         if node not in nodes:
             continue
         cpu, mem = pod_requests(p)
@@ -437,11 +461,13 @@ def capacity(pods, jobs, cfg, metrics=None):
         if metrics:
             nd["cpu_actual"] += metrics.get(p["metadata"]["name"], 0.0)
     for j in jobs:
-        if job_finished(j) or j["metadata"]["name"] in bound_jobs:
+        if job_finished(j):
             continue
         a = j["metadata"].get("annotations") or {}
-        nd = nodes.get(a.get("gq/node"))
-        if nd is not None:
+        for name in (a.get("gq/node") or "").split(","):  # a multi-node job lists one node per pod
+            nd = nodes.get(name)
+            if nd is None or (j["metadata"]["name"], name) in bound:
+                continue
             nd["gpu_used"] += int(a.get("gq/gpus", 0))
             nd["cpu_used"] += float(a.get("gq/cpu-request", 0))
             nd["mem_used"] += int(a.get("gq/mem-request", 0))
@@ -461,7 +487,7 @@ def capacity(pods, jobs, cfg, metrics=None):
 def reusable(req, pod, cfg):
     """Can req take over this idle pod? Same GPU count within its range, CPU/memory limits fit."""
     lo, hi = req["gpus"]
-    if not lo <= pod["gpus"] <= hi:
+    if req.get("nodes", 1) > 1 or not lo <= pod["gpus"] <= hi:
         return False
     cpu, mem = resources(req, pod["gpus"], cfg)
     return cpu <= pod["cpu"] and mem <= pod["mem"]
@@ -484,7 +510,11 @@ def place(queue, nodes, cfg, running, gq_gpus, idle=()):
     fit is checked on requests (what the scheduler counts), not limits.
 
     Without configured nodes (scheduler-placement mode) only gq's limits apply and the
-    decision has node None; a GPU range takes as many GPUs as the limits allow."""
+    decision has node None; a GPU range takes as many GPUs as the limits allow.
+
+    A multi-node job (req["nodes"] > 1) needs that many distinct nodes with its GPU count free
+    each; it takes the fullest ones that fit and its decision lists them comma-separated in
+    "node" (None in scheduler-placement mode)."""
     # ponytail: no reservation for big jobs, so they can starve under steady small-job
     # traffic. If that happens, stop backfilling onto the node closest to fitting the
     # head-of-line job once it has waited N minutes.
@@ -502,6 +532,32 @@ def place(queue, nodes, cfg, running, gq_gpus, idle=()):
         if running >= cfg["max_running"]:
             decisions.append((req, {"reason": "Cap", "message": "gq already runs %d jobs (max_running %d)"
                                     % (running, cfg["max_running"])}))
+            continue
+        n = req.get("nodes", 1)
+        if n > 1:
+            if gq_gpus + n * lo > cfg["max_gpus_total"]:
+                decisions.append((req, {"reason": "Cap", "message": "gq GPUs in use %d/%d; this job needs %d x %d"
+                                        % (gq_gpus, cfg["max_gpus_total"], n, lo)}))
+                continue
+            cpu, mem = resources(req, lo, cfg)
+            rcpu, rmem = requests_for(cpu, mem, cfg)
+            hosts = None
+            if cfg["nodes"]:
+                fits = sorted((nd for nd in nodes if nd["gpu_free"] >= lo and nd["cpu_req_free"] >= rcpu
+                               and nd["mem_req_free"] >= rmem), key=lambda x: (x["gpu_free"], -x["cpu_req_free"]))
+                if len(fits) < n:
+                    decisions.append((req, {"reason": "NoFit", "message": "%d nodes with %d free GPUs needed; %d have it"
+                                            % (n, lo, len(fits))}))
+                    continue
+                hosts = fits[:n]
+                for nd in hosts:
+                    nd["gpu_free"] -= lo
+                    nd["cpu_req_free"] -= rcpu
+                    nd["mem_req_free"] -= rmem
+            gq_gpus += n * lo
+            running += 1
+            decisions.append((req, {"node": ",".join(nd["name"] for nd in hosts) if hosts else None, "gpus": lo,
+                                    "nodes": n, "cpu": cpu, "mem": mem}))
             continue
         top = min(hi, cfg["max_gpus_total"] - gq_gpus)
         if top < lo:
@@ -546,12 +602,21 @@ def place(queue, nodes, cfg, running, gq_gpus, idle=()):
 # The Job's command (DESIGN 15.1). Runs a job, then waits up to `grace` seconds for gqd to hand
 # it the next one in <job dir>/next ("<id> [<task_index> <task_count>]"). Giving up, it claims
 # `next` itself with an exclusive create, so it and gqd cannot both win. Exits with the last rc.
+# In a multi-node job (GQ_NODES > 1, a PyTorchJob) rank r > 0 writes started.r, log.r and exit.r,
+# and torchrun finds the rendezvous in PET_* without arguments.
 WORKER = r"""set -f; root=%(root)s; grace=%(grace)d; id=$GQ_ID
 idre='^[0-9]{6}-[0-9]{6}-[0-9a-f]{4}(-[0-9]{1,3})?$'
+s=
+if [ "${GQ_NODES:-1}" -gt 1 ]; then
+  export GQ_NODE_RANK=${PET_NODE_RANK:-${RANK:-0}} GQ_MASTER_ADDR=$MASTER_ADDR GQ_MASTER_PORT=$MASTER_PORT
+  export PET_NNODES=$GQ_NODES PET_NODE_RANK=$GQ_NODE_RANK PET_NPROC_PER_NODE=$GQ_GPUS
+  export PET_MASTER_ADDR=$MASTER_ADDR PET_MASTER_PORT=$MASTER_PORT
+  [ "$GQ_NODE_RANK" -gt 0 ] && s=.$GQ_NODE_RANK
+fi
 while :; do
   d=$root/jobs/$id
-  date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ >"$d/started"
-  bash "$d/run.sh" >"$d/log" 2>&1; rc=$?
+  date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ >"$d/started$s"
+  bash "$d/run.sh" >"$d/log$s" 2>&1; rc=$?
   g=$grace
   if [ $$ -eq 1 ]; then  # pod's PID 1: kill what the job left running so the next job gets a clean GPU
     kill -9 -1 2>/dev/null
@@ -561,7 +626,7 @@ while :; do
     done
     [ -z "$left" ] || g=0  # something would not die: end the pod instead of handing it over
   fi
-  echo $rc >"$d/exit"
+  echo $rc >"$d/exit$s"
   [ "$g" -gt 0 ] || exit $rc
   end=$((SECONDS + grace)); line=
   while :; do
@@ -580,7 +645,7 @@ while :; do
 done"""
 
 
-def build_job(req, node, gpus, cpu, mem, attempt, cfg):
+def build_job(req, node, gpus, cpu, mem, attempt, cfg, grace=None):
     """The only Job shape gqd ever creates. Command and user env stay on the PVC (run.sh).
 
     cpu/mem are limits; requests come from requests_for(). The pod mounts every volume of
@@ -598,7 +663,8 @@ def build_job(req, node, gpus, cpu, mem, attempt, cfg):
     limits = {"cpu": fmt_cpu(cpu), "memory": fmt_mem(mem)}
     if gpus:
         limits[GPU] = str(gpus)
-    wrapper = WORKER % {"root": shlex.quote(cfg["root"]), "grace": cfg["reuse_grace"]}
+    grace = cfg["reuse_grace"] if grace is None else grace
+    wrapper = WORKER % {"root": shlex.quote(cfg["root"]), "grace": grace}
     mounts, volumes = [], []
     for i, v in enumerate(cfg["volumes"]):
         m = {"name": "v%d" % i, "mountPath": v["mountPath"]}
@@ -617,7 +683,7 @@ def build_job(req, node, gpus, cpu, mem, attempt, cfg):
             "annotations": {"gq/name": req["name"], "gq/owner": req["owner"], "gq/node": node or "",
                             "gq/gpus": str(gpus), "gq/cpu": str(cpu), "gq/mem": str(mem),
                             "gq/cpu-request": str(rcpu), "gq/mem-request": str(rmem),
-                            "gq/attempt": str(attempt), "gq/reuse-grace": str(cfg["reuse_grace"])},
+                            "gq/attempt": str(attempt), "gq/reuse-grace": str(grace)},
         },
         "spec": {
             "backoffLimit": 0,
@@ -653,9 +719,48 @@ def build_job(req, node, gpus, cpu, mem, attempt, cfg):
     return job
 
 
+def build_ptjob(req, nodes, gpus, cpu, mem, attempt, cfg):
+    """A multi-node job: a PyTorchJob of req["nodes"] pods shaped like build_job's, one per node.
+
+    The operator gang-schedules the pods (Volcano PodGroup), sets MASTER_ADDR/RANK and gives
+    up on the whole job when one pod fails. No pod reuse. nodes: "a,b,..." chosen by place()
+    or None; each pod may go to any of them, and anti-affinity keeps them on different nodes."""
+    job = build_job(req, None, gpus, cpu, mem, attempt, cfg, grace=0)
+    meta, spec, tmpl = job["metadata"], job["spec"], job["spec"]["template"]
+    name, n = meta["name"], req["nodes"]
+    meta["annotations"].update({"gq/node": nodes or "", "gq/nodes": str(n)})
+    tmpl["metadata"]["labels"]["gq-job"] = name
+    c = tmpl["spec"]["containers"][0]
+    c["name"] = "pytorch"  # the operator puts its env into the container with this name
+    c["env"].append({"name": "GQ_NODES", "value": str(n)})
+    aff = {"podAntiAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": [
+        {"labelSelector": {"matchLabels": {"gq-job": name}}, "topologyKey": "kubernetes.io/hostname"}]}}
+    if nodes:  # a metadata.name field selector takes one value, so one (ORed) term per node
+        aff["nodeAffinity"] = {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [
+            {"matchFields": [{"key": "metadata.name", "operator": "In", "values": [x]}]} for x in nodes.split(",")]}}
+    tmpl["spec"]["affinity"] = aff
+    del tmpl["spec"]["restartPolicy"]  # set per replica below
+
+    def replicas(k, role):
+        t = copy.deepcopy(tmpl)
+        t["metadata"]["labels"]["gq-role"] = role
+        return {"replicas": k, "restartPolicy": "Never", "template": t}
+
+    return {"apiVersion": "%s/%s" % PTJ[:2], "kind": "PyTorchJob", "metadata": meta, "spec": {
+        "runPolicy": {"backoffLimit": 0, "cleanPodPolicy": "Running",
+                      "activeDeadlineSeconds": spec["activeDeadlineSeconds"],
+                      "ttlSecondsAfterFinished": spec["ttlSecondsAfterFinished"]},
+        "pytorchReplicaSpecs": {"Master": replicas(1, "master"), "Worker": replicas(n - 1, "worker")}}}
+
+
+def main_status(pod):
+    """Status of the job's container: "main" in a Job, "pytorch" in a PyTorchJob."""
+    return next((c for c in (pod or {}).get("status", {}).get("containerStatuses") or []
+                 if c.get("name") in ("main", "pytorch")), None)
+
+
 def main_running(pod):
-    cs = next((c for c in (pod or {}).get("status", {}).get("containerStatuses") or [] if c.get("name") == "main"), None)
-    return "running" in ((cs or {}).get("state") or {})
+    return "running" in ((main_status(pod) or {}).get("state") or {})
 
 
 def derive_state(job, pod, exit_code, started=None):
@@ -677,8 +782,7 @@ def derive_state(job, pod, exit_code, started=None):
     if pod is not None:
         node = pod["spec"].get("nodeName")
         status = pod.get("status") or {}
-        cs = next((c for c in status.get("containerStatuses") or [] if c.get("name") == "main"), None)
-        st = (cs or {}).get("state") or {}
+        st = (main_status(pod) or {}).get("state") or {}
         if exit_code is not None and "running" in st:
             return r("succeeded" if exit_code == 0 else "failed", None if exit_code == 0 else "Error",
                      started=started or st["running"].get("startedAt"), code=exit_code, node=node)
@@ -707,7 +811,7 @@ def derive_state(job, pod, exit_code, started=None):
         failed = job_condition(job, "Failed")
         if failed:
             return r("lost", failed.get("reason") or "JobFailed", failed.get("message"))
-        if job_condition(job, "Complete"):
+        if job_end(job):
             return r("lost", "NoExitFile", "job completed but no exit file was found")
         return r("pending", "Creating")
     return r("lost", "Gone", "job and pod disappeared without an exit code")
@@ -736,9 +840,15 @@ class Kube:
         return json.loads(r.data)["items"]
 
     def list_jobs(self):
-        # All gq instances in the namespace: their unbound Jobs reserve capacity for everyone.
+        """Jobs and PyTorchJobs of all gq instances: their unbound pods reserve capacity for everyone."""
         r = self.batch.list_namespaced_job(self.ns, label_selector="gq=1", _preload_content=False)
-        return json.loads(r.data)["items"] + list(self._fake.values())
+        jobs = json.loads(r.data)["items"]
+        try:
+            jobs += self.custom.list_namespaced_custom_object(*PTJ[:2], self.ns, PTJ[2], label_selector="gq=1")["items"]
+        except self.ApiException as e:
+            if e.status not in (403, 404):  # no Training Operator here, or no right to list it
+                raise
+        return jobs + list(self._fake.values())
 
     def pod_metrics(self):
         r = self.custom.list_namespaced_custom_object("metrics.k8s.io", "v1beta1", self.ns, "pods")
@@ -746,9 +856,13 @@ class Kube:
                 for i in r.get("items", [])}
 
     def create_job(self, body):
-        """True if created, False if a Job with that name already exists."""
+        """True if created, False if a Job (or PyTorchJob) with that name already exists."""
+        dry = "All" if self.dry_run else None
         try:
-            self.batch.create_namespaced_job(self.ns, body, dry_run="All" if self.dry_run else None)
+            if body["kind"] == "PyTorchJob":
+                self.custom.create_namespaced_custom_object(*PTJ[:2], self.ns, PTJ[2], body, dry_run=dry)
+            else:
+                self.batch.create_namespaced_job(self.ns, body, dry_run=dry)
         except self.ApiException as e:
             if e.status == 409:
                 return False
@@ -767,13 +881,17 @@ class Kube:
         self.batch.patch_namespaced_job(name, self.ns, {"spec": {"activeDeadlineSeconds": seconds}},
                                         dry_run="All" if self.dry_run else None)
 
-    def delete_job(self, name):
+    def delete_job(self, name, kind="Job"):
         if not self.own_job.match(name):
             raise ValueError("refusing to delete a Job this instance did not create: %r" % name)
         if self._fake.pop(name, None) is not None:
             return
         try:
-            self.batch.delete_namespaced_job(name, self.ns, propagation_policy="Background")
+            if kind == "PyTorchJob":
+                self.custom.delete_namespaced_custom_object(*PTJ[:2], self.ns, PTJ[2], name,
+                                                            propagation_policy="Background")
+            else:
+                self.batch.delete_namespaced_job(name, self.ns, propagation_policy="Background")
         except self.ApiException as e:
             if e.status != 404:
                 raise
@@ -806,9 +924,9 @@ class Daemon:
     def _read_json(self, rid, name):
         return json.loads(read_small(os.path.join(self._dir(rid), name), MAX_REQ_BYTES))
 
-    def _exit_code(self, rid):
+    def _exit_code(self, rid, name="exit"):
         try:
-            return int(read_small(os.path.join(self._dir(rid), "exit"), 32).strip())
+            return int(read_small(os.path.join(self._dir(rid), name), 32).strip())
         except (OSError, ValueError, Invalid):
             return None
 
@@ -862,7 +980,7 @@ class Daemon:
             ann = j["metadata"].get("annotations") or {}
             if name not in self.pods and name not in self._ended:  # e.g. created before a restart
                 try:
-                    gpus = int(ann.get("gq/gpus") or 0)
+                    gpus = int(ann.get("gq/gpus") or 0) * int(ann.get("gq/nodes") or 1)
                 except ValueError:
                     gpus = None
                 self.pods[name] = {"created": j["metadata"].get("creationTimestamp"), "node": ann.get("gq/node") or None,
@@ -872,7 +990,7 @@ class Daemon:
             if pod is not None and name in self.pods:
                 self.pods[name]["node"] = pod["spec"].get("nodeName") or self.pods[name]["node"]
             if job_finished(j) and name not in self._ended:
-                cond = job_condition(j, "Complete") or job_condition(j, "Failed")
+                cond = job_end(j)
                 ended = (j.get("status") or {}).get("completionTime") or cond.get("lastTransitionTime") or iso(now)
                 self._pod_ended(name, ended, cond.get("reason") or cond["type"])
         for name in list(self.pods):
@@ -955,7 +1073,8 @@ class Daemon:
         jobs_by_name = {j["metadata"]["name"]: j for j in jobs}
         pods_by_job = {}
         for p in pods:
-            if (p["metadata"].get("labels") or {}).get("gq") != "1":
+            labels = p["metadata"].get("labels") or {}
+            if labels.get("gq") != "1" or labels.get("gq-role") == "worker":  # a PyTorchJob reports via its master
                 continue
             jn = pod_job_name(p)
             prev = pods_by_job.get(jn)
@@ -977,7 +1096,7 @@ class Daemon:
         active = [r for r in self.tracked.values() if r["state"] in ACTIVE]
         idle = list(self.idle.values())
         decisions, nodes_after = place(queue, cap["nodes"], self.cfg, len(active) + len(idle),
-                                       sum(r.get("gpus") or 0 for r in active) + sum(p["gpus"] for p in idle), idle)
+                                       sum(map(total_gpus, active)) + sum(p["gpus"] for p in idle), idle)
         position, blocked = 0, False
         for req, dec in decisions:
             rec = self.tracked[req["id"]]
@@ -1051,9 +1170,12 @@ class Daemon:
         if rec["state"] in TERMINAL:
             return
         if rec.get("job"):
-            self.kube.delete_job(rec["job"])
+            self._delete(rec)
         unlink_quiet(os.path.join(self.spool, rid + ".submit"))
         self._finish(rec, "killed", "Killed", "killed by gq kill", now)
+
+    def _delete(self, rec):
+        self.kube.delete_job(rec["job"], "PyTorchJob" if (rec.get("nodes") or 1) > 1 else "Job")
 
     def _update_placed(self, rec, job, pod, now):
         started = self._started(rec["id"])
@@ -1065,7 +1187,15 @@ class Daemon:
             self._requeue(rec, "HandoffFailed", "the pod ended before taking this job; placing it again")
             return
         st = derive_state(job, pod, self._exit_code(rec["id"]), started)
+        for r in range(1, rec.get("nodes") or 1):  # any rank that failed fails the job (rank 0 is in st)
+            code = self._exit_code(rec["id"], "exit.%d" % r)
+            if code:
+                st.update(state="failed", reason="Error", message="node rank %d exited with %d" % (r, code),
+                          exit_code=code)
+                break
         if st["state"] in TERMINAL:
+            if (rec.get("nodes") or 1) > 1 and st["state"] != "succeeded":
+                self._delete(rec)  # do not leave the other ranks waiting on a dead peer
             rec.update({k: v for k, v in st.items() if v is not None or k in ("reason", "message")})
             self._finish(rec, st["state"], st["reason"], st["message"], now)
             self._maybe_idle(rec, job, pod, now)
@@ -1078,16 +1208,16 @@ class Daemon:
                         started=rec["started"], reused=rec.get("reused"))
         started, waiting_since = parse_ts(rec.get("started")), parse_ts(rec.get("ready") or rec["submitted"])
         if rec["state"] == "running" and started and (now - started).total_seconds() > rec["time"]:
-            self.kube.delete_job(rec["job"])
+            self._delete(rec)
             self._finish(rec, "timeout", "TimeLimit", "ran longer than --time (%ds)" % rec["time"], now)
         elif rec["state"] == "pending" and rec["wait_timeout"] and (now - waiting_since).total_seconds() > rec["wait_timeout"]:
-            self.kube.delete_job(rec["job"])
+            self._delete(rec)
             self._finish(rec, "expired", "WaitTimeout",
                          "did not start within --wait-timeout (%ds)" % rec["wait_timeout"], now)
         elif (rec["state"] == "pending" and rec["reason"] == "Unschedulable" and rec.get("pinned", True)
               and (now - parse_ts(rec["placed"])).total_seconds() > self.cfg["placement_grace"]):
             # Our capacity estimate was wrong (someone took the slot). Re-place on a new Job name.
-            self.kube.delete_job(rec["job"])
+            self._delete(rec)
             log.info("re-placing %s: %s", rec["id"], rec.get("message"))
             self._requeue(rec, "Replace", "lost the scheduling race; re-placing")
 
@@ -1105,7 +1235,7 @@ class Daemon:
             grace = int(((job or {}).get("metadata", {}).get("annotations") or {}).get("gq/reuse-grace") or 0)
         except ValueError:
             grace = 0
-        if grace <= 0 or self.cfg["reuse_grace"] <= 0 or not rec.get("gpus") or rec.get("exit_code") is None \
+        if grace <= 0 or self.cfg["reuse_grace"] <= 0 or not rec.get("gpus") or (rec.get("nodes") or 1) > 1 or rec.get("exit_code") is None \
                 or not main_running(pod):
             return
         self.idle[rec["job"]] = {"job": rec["job"], "rid": rec["id"], "node": pod["spec"].get("nodeName"),
@@ -1181,7 +1311,7 @@ class Daemon:
                 except (OSError, ValueError, Invalid) as e:
                     self._reject(rid, "Invalid", str(e), now)
                     continue
-                rec = {k: req.get(k) for k in ("id", "group", "task_index", "task_count", "name", "owner",
+                rec = {k: req.get(k) for k in ("id", "group", "task_index", "task_count", "name", "owner", "nodes",
                                                 "time", "wait_timeout", "submitted")}
                 rec.update(backend="pod", state="queued", reason=None, message=None, queue_position=None,
                            gpus=None, gpus_requested=req["gpus"], cpu=None, mem=None, node=None, job=None,
@@ -1189,7 +1319,7 @@ class Daemon:
                            after=req.get("after"), ready=None, _req=req)
                 self.tracked[rid] = rec
                 self._event("submitted", id=rid, name=req["name"] or None, owner=req["owner"] or None,
-                            gpus=req["gpus"], time=req["time"], after=req.get("after"), group=req.get("group"),
+                            gpus=req["gpus"], nodes=req["nodes"] if req["nodes"] > 1 else None, time=req["time"], after=req.get("after"), group=req.get("group"),
                             submitted=req["submitted"])
             deps = [a for a in rec["_req"].get("after") or [] if not self._done(a)]
             if deps:  # not eligible yet; does not hold up the FIFO or count toward max_queue
@@ -1210,7 +1340,8 @@ class Daemon:
         return queue[:self.cfg["max_queue"]]
 
     def _create(self, rec, req, dec, now):
-        body = build_job(req, dec["node"], dec["gpus"], dec["cpu"], dec["mem"], rec.get("attempt", 1), self.cfg)
+        build = build_ptjob if req["nodes"] > 1 else build_job
+        body = build(req, dec["node"], dec["gpus"], dec["cpu"], dec["mem"], rec.get("attempt", 1), self.cfg)
         try:
             created = self.kube.create_job(body)
         except Exception as e:
@@ -1226,9 +1357,10 @@ class Daemon:
                    pinned=dec["node"] is not None)
         unlink_quiet(os.path.join(self.spool, rec["id"] + ".submit"))
         name = body["metadata"]["name"]
-        self.pods[name] = {"created": iso(now), "node": dec["node"], "gpus": dec["gpus"], "tasks": [rec["id"]]}
+        self.pods[name] = {"created": iso(now), "node": dec["node"], "gpus": total_gpus(rec), "tasks": [rec["id"]]}
         self._ended.discard(name)
-        self._event("placed", id=rec["id"], job=name, node=dec["node"], gpus=dec["gpus"], cpu=dec["cpu"],
+        self._event("placed", id=rec["id"], job=name, node=dec["node"], gpus=dec["gpus"], nodes=dec.get("nodes"),
+                    cpu=dec["cpu"],
                     mem=fmt_mem(dec["mem"]), attempt=rec.get("attempt", 1))
         log.info("placed %s on %s (%d GPU)", rec["id"], dec["node"], dec["gpus"])
 
@@ -1247,7 +1379,7 @@ class Daemon:
             "total_gpu_free": sum(nd["gpu_free"] for nd in nodes) if nodes else None,
             "max_gpu_free_on_node": max(nd["gpu_free"] for nd in nodes) if nodes else None,
             "gpu_waiting": cap["gpu_waiting"],
-            "gq_gpus_in_use": sum(r.get("gpus") or 0 for r in active) + sum(p["gpus"] for p in idle),
+            "gq_gpus_in_use": sum(map(total_gpus, active)) + sum(p["gpus"] for p in idle),
             "gq_gpus_cap": self.cfg["max_gpus_total"],
             "gq_running": len(active) + len(idle), "gq_max_running": self.cfg["max_running"],
             "idle_pods": [{"job": p["job"], "node": p["node"], "gpus": p["gpus"],

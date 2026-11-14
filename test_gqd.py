@@ -307,8 +307,9 @@ class FakeKube:
         assert self.own.match(name), "patched another instance's Job: " + name
         self.jobs[name]["spec"]["activeDeadlineSeconds"] = seconds
 
-    def delete_job(self, name):
+    def delete_job(self, name, kind="Job"):
         assert self.own.match(name), "deleted another instance's Job: " + name
+        assert name not in self.jobs or self.jobs[name].get("kind", "Job") == kind, "wrong kind for " + name
         self.jobs.pop(name, None)
         self.pods[:] = [p for p in self.pods if gqd.pod_job_name(p) != name]
         self.deleted.append(name)
@@ -665,6 +666,84 @@ def test_scheduler_placement_mode():
         assert "no node list configured" in run_gq("capacity")[1]
 
 
+def test_multinode():
+    """--nodes N: N distinct nodes with G free GPUs each, one PyTorchJob, failure of any rank fails it."""
+    c = cfg(max_gpus_total=8)
+    v = lambda **kw: gqd.validate(req(**kw), c)
+    assert v(gpus=(2, 2), nodes=2)["nodes"] == 2 and v()["nodes"] == 1
+    for bad in (dict(gpus=(1, 2), nodes=2), dict(gpus=(0, 0), nodes=2), dict(gpus=(4, 4), nodes=3),
+                dict(gpus=(1, 1), nodes=5), dict(nodes=0), dict(nodes=True)):
+        try:
+            v(**bad)
+            raise AssertionError("accepted %r" % (bad,))
+        except gqd.Invalid:
+            pass
+    q = lambda n, g: [v(gpus=(g, g), nodes=n)]
+    # 2 + 1 + 1 + 0 free: two 1-GPU ranks take the fullest nodes and keep the 2-GPU slot.
+    dec, after = gqd.place(q(2, 1), free([2, 1, 1, 0]), c, 0, 0)
+    assert dec[0][1]["node"] == "n-b,n-c" and dec[0][1]["nodes"] == 2 and [n["gpu_free"] for n in after] == [2, 0, 0, 0]
+    dec, _ = gqd.place(q(2, 2), free([2, 1, 1, 0]), c, 0, 0)
+    assert dec[0][1]["reason"] == "NoFit" and "2 nodes with 2 free GPUs needed; 1 have it" in dec[0][1]["message"]
+    dec, _ = gqd.place(q(2, 2), free([8, 8, 8, 8]), c, 0, 5)                       # 5 + 2x2 > 8
+    assert dec[0][1]["reason"] == "Cap"
+    idle = [{"job": "gq-t-x-a1", "node": "n-a", "gpus": 1, "cpu": 15.0, "mem": 245 * 2**30}]
+    dec, _ = gqd.place(q(2, 1), free([2, 1, 1, 0]), c, 1, 1, idle)
+    assert "reuse" not in dec[0][1]                                                  # never takes over a pod
+    dec, _ = gqd.place(q(2, 1), [], cfg(nodes=[], max_gpus_total=8), 0, 0)
+    assert dec[0][1]["node"] is None and dec[0][1]["nodes"] == 2
+
+    j = gqd.build_ptjob(q(2, 1)[0], "n-b,n-c", 1, 15.0, 245 * 2**30, 1, c)
+    assert j["kind"] == "PyTorchJob" and j["spec"]["runPolicy"]["backoffLimit"] == 0
+    reps = j["spec"]["pytorchReplicaSpecs"]
+    assert (reps["Master"]["replicas"], reps["Worker"]["replicas"]) == (1, 1)
+    t = reps["Worker"]["template"]
+    assert t["metadata"]["labels"]["zone"] == "z" and t["metadata"]["labels"]["gq-role"] == "worker"
+    ct = t["spec"]["containers"][0]
+    assert ct["name"] == "pytorch" and {"name": "GQ_NODES", "value": "2"} in ct["env"]
+    assert "grace=0;" in ct["command"][2] and j["metadata"]["annotations"]["gq/reuse-grace"] == "0"
+    aff = t["spec"]["affinity"]
+    assert [t["matchFields"][0]["values"] for t in aff["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"][
+        "nodeSelectorTerms"]] == [["n-b"], ["n-c"]]                                 # one value per field selector
+    assert "restartPolicy" not in t["spec"] and reps["Master"]["restartPolicy"] == "Never"
+    assert aff["podAntiAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"][0]["labelSelector"] == {
+        "matchLabels": {"gq-job": j["metadata"]["name"]}}
+
+    # Capacity: an unbound PyTorchJob reserves on every listed node until its pod there is bound.
+    p = pod("m", "n-b", gpus=1, labels={"gq": "1", "gq-job": "gq-t-p-a1", "gq-role": "master"})
+    ptj = {"metadata": {"name": "gq-t-p-a1", "annotations": {"gq/node": "n-b,n-c", "gq/gpus": "1", "gq/nodes": "2"}},
+           "status": {}}
+    assert [n["gpu_free"] for n in gqd.capacity([p], [ptj], c)["nodes"]] == [8, 7, 7, 8]
+    ptj["status"] = {"conditions": [{"type": "Succeeded", "status": "True"}]}
+    assert gqd.job_finished(ptj)
+
+    with sandbox() as home:
+        c = cfg(volumes=[{"pvc": "ws", "mountPath": home}], root=home + "/gq", max_gpus_total=8)
+        kube, clock = FakeKube(), Clock()
+        d = gqd.Daemon(c, os.environ["GQ_ROOT"], kube, clock=clock)
+        assert run_gq("submit", "--nodes", "2", "--gpus", "1-2", "--time", "1h", "--", "true")[0] != 0
+        rid = json.loads(run_gq("submit", "--nodes", "2", "--gpus", "2", "--time", "1h", "--", "true")[1])["id"]
+        d.loop_once()
+        st = status(rid)
+        assert (st["state"], st["nodes"], st["gpus"]) == ("pending", 2, 2)
+        assert kube.jobs[st["job"]]["kind"] == "PyTorchJob"
+        assert json.loads(run_gq("capacity", "--json")[1])["gq_gpus_in_use"] == 4
+        assert "2x2" in run_gq("ps")[1]
+        started = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        m = pod("m", st["node"].split(",")[0], gpus=2, labels={"gq": "1", "gq-job": st["job"], "gq-role": "master"})
+        m["status"]["containerStatuses"] = [{"name": "pytorch", "state": {"running": {"startedAt": started}}}]
+        w = pod("w", st["node"].split(",")[1], gpus=2, phase="Failed",
+                labels={"gq": "1", "gq-job": st["job"], "gq-role": "worker"})
+        kube.pods += [m, w]
+        d.loop_once()
+        assert status(rid)["state"] == "running"
+        with open(os.path.join(home, "gq", "jobs", rid, "exit.1"), "w") as f:
+            f.write("3\n")
+        d.loop_once()
+        st = status(rid)
+        assert (st["state"], st["exit_code"]) == ("failed", 3) and "rank 1" in st["message"]
+        assert st["job"] in kube.deleted and st["job"] not in kube.jobs and not d.idle
+
+
 def test_gqctl_notebook_side_scripts():
     """The scripts gqctl install runs in the notebook, run here against a temp $HOME."""
     import subprocess
@@ -785,6 +864,25 @@ def test_worker_script():
         read = lambda rid, f: open(os.path.join(jobs, rid, f)).read().strip()
         assert read(a, "exit") == "3" and read(b, "exit") == "0" and read(b, "log") == "%s 2 5" % b
         assert gqd.parse_ts(read(b, "started")) and read(b, "next") == "closed"   # closed it, so gqd cannot
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_worker_multinode_rank():
+    """Rank r > 0 of a multi-node job writes its own files and torchrun finds the rendezvous in PET_*."""
+    tmp = tempfile.mkdtemp()
+    try:
+        rid = "261108-070000-aaaa"
+        d = os.path.join(tmp, "jobs", rid)
+        os.makedirs(d)
+        open(os.path.join(d, "run.sh"), "w").write(
+            'echo "$PET_MASTER_ADDR:$PET_MASTER_PORT $PET_NNODES $PET_NODE_RANK $PET_NPROC_PER_NODE"; exit 4\n')
+        env = dict(os.environ, GQ_ID=rid, GQ_NODES="2", GQ_GPUS="8", PET_NODE_RANK="1", MASTER_ADDR="m0",
+                   MASTER_PORT="23456")
+        assert subprocess.run(["bash", "-c", gqd.WORKER % {"root": tmp, "grace": 0}], env=env, timeout=10).returncode == 4
+        read = lambda f: open(os.path.join(d, f)).read().strip()
+        assert read("log.1") == "m0:23456 2 1 8" and read("exit.1") == "4" and gqd.parse_ts(read("started.1"))
+        assert not os.path.exists(os.path.join(d, "exit"))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

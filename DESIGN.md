@@ -775,3 +775,21 @@ Job 컨테이너의 명령은 gqd가 만든 bash worker다(코드는 ConfigMap�
 - **pod 이벤트** (`job` 있음): `pod_idle`(작업이 끝나고 이어 받기를 기다림), `pod_released`(대기 작업이 막혀서 유휴 pod를 반납), `pod_ended`(Job이 완료/실패하거나 사라짐: created, ended, seconds, tasks, outcome). pod 생성 시각은 `placed`와 `pod_ended.created`에 있다.
 - **재시작:** `pod_ended`는 Job마다 한 번만 쓴다. gqd가 시작할 때 이번 달과 지난달 파일에서 이미 쓴 것을 읽어 중복을 막는다. 재시작 전부터 있던 Job도 끝나면 기록한다(그 pod에서 돈 작업 목록은 아는 만큼만). gqd가 꺼져 있는 동안 끝나고 TTL(1시간)까지 지나 사라진 Job은 빠진다.
 - **보기:** `gq events [--since 7d] [--job ID|그룹|Job 이름] [--json]`.
+
+## 17. 여러 노드 작업 (`--nodes`)
+
+목표: 노드마다 조금씩 남은 GPU를 묶어 하나의 분산 학습으로 돌린다. 한 노드에 자리가 날 때까지 기다릴지, 지금 흩어진 자리로 돌릴지는 제출하는 쪽이 `--nodes`로 정한다.
+
+- **요청:** `nodes`(기본 1). 2 이상이면 `gpus`는 고정값(노드당 장수)이어야 하고, `nodes × gpus ≤ max_gpus_total`, 노드 목록이 있으면 `nodes ≤ 노드 수`. 이 검사가 노드 수의 상한 역할도 한다.
+- **리소스:** 일반 Job 대신 **PyTorchJob**(Master 1 + Worker N-1)을 만든다. pod 모양은 `build_job`과 같고(볼륨, 라벨, request/limit), 다음만 다르다.
+  - 컨테이너 이름 `pytorch`(operator가 환경변수를 넣는 대상), `GQ_NODES` 추가, `reuse_grace` 0.
+  - 노드 목록이 있으면 고른 노드들로 nodeAffinity(`In`), 그리고 같은 PyTorchJob의 pod끼리 hostname anti-affinity로 한 노드에 하나씩.
+  - `runPolicy`: `backoffLimit 0`, `cleanPodPolicy Running`, 같은 deadline/TTL.
+  - gang 배치와 MASTER_ADDR/RANK 주입은 operator(Volcano PodGroup)가 한다.
+- **TrainJob을 쓰지 않은 이유:** 더 새 API(Trainer v2)지만, 대상 클러스터에서 gqd의 서비스 계정(`default-editor`)에 `trainjobs`/`trainingruntimes` 쓰기 권한이 없었다. 권한이 생기면 `build_ptjob`과 `Kube`의 생성·삭제만 바꾸면 된다(상태는 condition `Complete`/`Failed`로 비슷하다).
+- **배치:** `place()`에서 노드당 G장과 request가 들어가는 노드를 가장 꽉 찬 순으로 N개 고른다. 모자라면 `NoFit`. 결정의 `node`는 쉼표로 이은 노드 목록이고, `gq/node` 주석에도 그대로 들어간다. `capacity()`는 아직 pod가 바인딩되지 않은 (작업, 노드) 쌍마다 예약을 센다. 상한에는 `nodes × gpus`를 센다.
+- **worker:** `GQ_NODES > 1`이면 rank(`PET_NODE_RANK`, 없으면 `RANK`)를 읽어 `PET_*`(torchrun 기본값)와 `GQ_NODE_RANK`, `GQ_MASTER_ADDR/PORT`를 export한다. rank r>0은 `started.r`, `log.r`, `exit.r`에 쓴다.
+- **상태:** Master pod와 `exit`로 `derive_state`를 그대로 쓰고(컨테이너 이름만 `main`/`pytorch` 둘 다 본다), `exit.r` 중 하나라도 0이 아니면 `failed`. 성공이 아닌 종료면 PyTorchJob을 지워 다른 rank가 죽은 상대를 기다리지 않게 한다. `pods_by_job`에는 Master pod만 넣는다(`gq-role` 라벨).
+- **이어 받기 없음:** 여러 노드 작업은 유휴 pod를 이어 받지도, 남기지도 않는다.
+- **확인:** `build_ptjob`으로 만든 PyTorchJob을 실제 클러스터에서 돌렸다. 2노드 × 1장 NCCL all_reduce가 `NET/IB` + GPUDirect RDMA로 45.7 GB/s(이미지에 `libibverbs` 필요), 한 rank가 실패하면 operator가 PyTorchJob을 `Failed`로 만들고 기다리던 master를 지웠다. 배포된 gqd를 거친 확인은 아직이다.
+- **지원하지 않음:** 노드마다 다른 장수(예: 2+1+1). PyTorchJob의 replica가 한 모양이기 때문이다.

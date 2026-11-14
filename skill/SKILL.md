@@ -26,6 +26,7 @@ The nodes are shared with other people. **A job runs on one node only.** A 4-GPU
 | Independent pieces (shards, seeds, models, sweeps) | `gq submit --array 8 --gpus 1 --time 2h -- bash -c 'python eval.py --shard $GQ_TASK_INDEX --num-shards $GQ_TASK_COUNT'` |
 | Several light pieces (each uses a fraction of one GPU) | One `--gpus 1` job running them together; see "Light pieces share one GPU" below |
 | Program that adapts to any GPU count | `gq submit --gpus 1-4 --time 8h -- bash -c 'torchrun --nproc_per_node $GQ_GPUS train.py'` |
+| One training run needing more GPUs than any single node has free (only when waiting is worse; cross-node is slower) | `gq submit --nodes 2 --gpus 1 --time 4h -- torchrun train.py` (G GPUs on each of N nodes; torchrun needs no arguments; rank r logs to `log.r`) |
 | Next step after another job, regardless of its result | `gq submit --after <id> --gpus 1 --time 1h -- python eval.py` |
 | CPU job that fits this notebook | `gq submit --local --time 1h -- python preprocess.py` |
 | Larger CPU job | `gq submit --cpu 32 --mem 128Gi --time 2h -- python preprocess.py` |
