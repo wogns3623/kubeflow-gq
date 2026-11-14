@@ -886,12 +886,16 @@ def test_reuse_end_to_end():
         kube.run(status(e)["job"], status(e)["node"])
         d.loop_once()
         f = sub("--gpus", "1", "--after", e)
+        d.loop_once()
+        d.tracked[f]["submitted"] = gqd.iso(clock() - dt.timedelta(hours=7))  # as if E ran 7h: past f's --wait-timeout (6h)
         put(e, "next", "closed\n")
         put(e, "exit", "0\n")
         d.loop_once()
         assert status(f)["state"] == "queued" and not d.idle
         d.loop_once()
         assert status(f)["state"] == "pending" and status(f)["job"] != status(e)["job"] and not status(f).get("reused")
+        d.loop_once()
+        assert status(f)["state"] == "pending"   # --wait-timeout counts from when E ended, not from submit
 
         # the pod died after the handoff but before starting the job: placed again
         job_f = status(f)["job"]

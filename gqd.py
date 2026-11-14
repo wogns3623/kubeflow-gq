@@ -1075,11 +1075,11 @@ class Daemon:
         if prev != "running" and rec["state"] == "running":
             self._event("started", id=rec["id"], job=rec.get("job"), node=rec["node"], gpus=rec.get("gpus"),
                         started=rec["started"], reused=rec.get("reused"))
-        started, submitted = parse_ts(rec.get("started")), parse_ts(rec["submitted"])
+        started, waiting_since = parse_ts(rec.get("started")), parse_ts(rec.get("ready") or rec["submitted"])
         if rec["state"] == "running" and started and (now - started).total_seconds() > rec["time"]:
             self.kube.delete_job(rec["job"])
             self._finish(rec, "timeout", "TimeLimit", "ran longer than --time (%ds)" % rec["time"], now)
-        elif rec["state"] == "pending" and (now - submitted).total_seconds() > rec["wait_timeout"]:
+        elif rec["state"] == "pending" and (now - waiting_since).total_seconds() > rec["wait_timeout"]:
             self.kube.delete_job(rec["job"])
             self._finish(rec, "expired", "WaitTimeout",
                          "did not start within --wait-timeout (%ds)" % rec["wait_timeout"], now)
