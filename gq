@@ -579,8 +579,21 @@ def cmd_wait(a):
     ids = expand(a.id)
     sts = follow(ids, None, parse_duration(a.timeout) if a.timeout else None)
     if sts is None:
-        print(json.dumps({"id": a.id, "state": "waiting", "message": "--timeout reached; the job keeps running"}),
-              file=sys.stderr)
+        # Say what is actually going on and what to do: this is where the agent decides.
+        left = [s for s in (load_status(i) for i in ids) if s.get("state") not in TERMINAL]
+        states = {}
+        for s in left:
+            k = s.get("state") or "?"
+            if k == "queued" and s.get("reason"):
+                k += " (%s)" % s["reason"]
+            states[k] = states.get(k, 0) + 1
+        waiting = [s for s in left if s.get("state") != "running"]
+        msg = "--timeout reached; nothing was killed"
+        if waiting:
+            msg += ("; not started yet and %s" % ("will not expire" if not any(s.get("wait_timeout") for s in waiting)
+                                                  else "expires after its --wait-timeout"))
+        msg += ". Wait again, or `gq kill %s` if you no longer need it" % a.id
+        print(json.dumps({"id": a.id, "state": "waiting", "states": states, "message": msg}), file=sys.stderr)
         return 124
     print(json.dumps(summary(a.id, sts)))
     return result_code(sts)

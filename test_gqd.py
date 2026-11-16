@@ -486,6 +486,10 @@ def test_end_to_end():
         d2.loop_once()
         assert status(rid_n)["state"] == "queued" and json.load(open(os.path.join(
             os.environ["GQ_ROOT"], "jobs", rid_n, "request.json")))["wait_timeout"] is None
+        code, _, err = run_gq("wait", rid_n, "--timeout", "1s")    # where the agent decides: say so
+        w = json.loads(err.strip().splitlines()[-1])
+        assert code == 124 and list(w["states"]) in (["queued (Cap)"], ["queued (NoFit)"]) and "will not expire" in w["message"]
+        assert "gq kill %s" % rid_n in w["message"]
         run_gq("kill", rid_n)
         d2.loop_once()
 
