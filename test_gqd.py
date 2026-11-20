@@ -432,6 +432,9 @@ def test_end_to_end():
         assert nodes == ["n-a", "n-a", "n-b", "n-c"], nodes
         ps = json.loads(run_gq("ps", "--json", "--mine")[1])
         assert {s["id"] for s in ps} >= set(out["tasks"])
+        here = json.loads(run_gq("ps", "--json", "--under", os.getcwd())[1])
+        assert {s["id"] for s in here} >= set(out["tasks"])
+        assert json.loads(run_gq("ps", "--json", "--under", os.path.join(os.getcwd(), "elsewhere"))[1]) == []
         run_gq("kill", out["id"])
         d.loop_once()
         assert all(status(t)["state"] == "killed" for t in out["tasks"])

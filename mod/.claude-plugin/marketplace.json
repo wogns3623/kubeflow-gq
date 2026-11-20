@@ -1,0 +1,5 @@
+{
+  "name": "gq",
+  "owner": { "name": "gq" },
+  "plugins": [{ "name": "gq-status", "source": "./" }]
+}

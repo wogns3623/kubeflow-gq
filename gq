@@ -729,12 +729,17 @@ def cmd_ps(a):
     names = sorted(n for n in os.listdir(jobs) if ID_RE.match(n)) if os.path.isdir(jobs) else []
     sts = []
     me = my_owner()
+    under = (on_mount(a.under)[0] or os.path.abspath(a.under)).rstrip("/") if a.under else None
     for name in names:
         st = load_status(name)
         if not a.all and st.get("state") in TERMINAL and (age(st.get("finished")) or 0) > RECENT:
             continue
         if a.mine and st.get("owner") != me:
             continue
+        if under:  # gqd's status.json drops cwd; request.json keeps it
+            cwd = st.get("cwd") or (read_json(os.path.join(job_dir(name), "request.json")) or {}).get("cwd") or ""
+            if cwd != under and not cwd.startswith(under + "/"):
+                continue
         sts.append(st)
     if a.json:
         print(json.dumps(sts, indent=1))
@@ -855,6 +860,7 @@ def build_parser():
     p.add_argument("--json", action="store_true")
     p.add_argument("--all", action="store_true", help="include jobs that finished more than 24h ago")
     p.add_argument("--mine", action="store_true", help="only jobs with my owner ($GQ_OWNER)")
+    p.add_argument("--under", metavar="DIR", help="only jobs submitted from DIR or below it")
     p = sub.add_parser("kill", help="stop a job or array group")
     p.add_argument("id")
     p = sub.add_parser("events", help="gq's own record: submits, placements, handoffs, pod lifetimes")

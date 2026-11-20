@@ -1,0 +1,6 @@
+{
+  "name": "gq-status",
+  "version": "0.1.0",
+  "description": "Shows this project's gq jobs above the prompt and gq's GPU use in the status line",
+  "types": "./types/index.d.ts"
+}

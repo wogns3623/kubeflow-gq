@@ -519,6 +519,10 @@ def cmd_install(a):
     nb_exec(ns, pod, ctr, ["mkdir", "-p", rootd + "/bin", rootd + "/spool", rootd + "/jobs", skills])
     kubectl("cp", os.path.join(HERE, "gq"), "%s/%s:%s/bin/gq" % (ns, pod, rootd), "-c", ctr)
     kubectl("cp", os.path.join(HERE, "skill", "SKILL.md"), "%s/%s:%s/SKILL.md" % (ns, pod, skills), "-c", ctr)
+    # The Claude Code mod (README: 작업 상태를 세션 안에서 보기). A folder marketplace is read in place,
+    # so replacing the folder updates every session that installed it on its next start.
+    nb_exec(ns, pod, ctr, ["rm", "-rf", rootd + "/claude-plugin"])
+    kubectl("cp", os.path.join(HERE, "mod"), "%s/%s:%s/claude-plugin" % (ns, pod, rootd), "-c", ctr)
     nb_exec(ns, pod, ctr, ["chmod", "755", rootd + "/bin/gq"])
     nb_exec(ns, pod, ctr, ["sh", "-c", "cat > %s/env.sh" % shlex.quote(rootd)], stdin=render_env_sh(rootd))
     nb_exec(ns, pod, ctr, ["sh", "-c", "cat > %s/completion.bash" % shlex.quote(rootd)], stdin=completion_script())
@@ -537,6 +541,8 @@ def cmd_install(a):
                                      json.dumps(CLAUDE_RULES)], stdin=CLAUDE_SETTINGS_PY).strip()
         print("  claude settings: %s (allow gq, deny kubectl; backup *.before-gq)" % out.lower().replace("_", " "))
     print("open a new terminal in the notebook (or `source ~/.bashrc`) to pick up gq")
+    print("job status in Claude Code (once, in the notebook): claude plugin marketplace add %s/claude-plugin"
+          " && claude plugin install gq-status@gq" % rootd)
     return 0
 
 

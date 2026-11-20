@@ -39,6 +39,7 @@
 | `gq` | CLI. 파일만 읽고 쓰며 표준 라이브러리만 쓴다 | 내 노트북 (`<root>/bin/gq`) |
 | `gqd.py` | 데몬. 요청 검증, 자원 계산, 배치, Job 생성, 시간 집행 | `gqd-<instance>` pod (ConfigMap) |
 | `skill/SKILL.md` | 에이전트용 사용 규칙 | 내 노트북 (`~/.claude/skills/gq/`) |
+| `mod/` | Claude Code 모드: 세션마다 그 프로젝트의 gq 작업을 보여 준다 | 내 노트북 (`<root>/claude-plugin`) |
 | `examples/config.mlxp.json` | MLXP에서 `gqctl init`이 만드는 설정 예시 (값은 가상) | 참고용 |
 | `examples/config.kubeflow.json` | 일반 Kubeflow 설정 예시 (scheduler 배치 모드, 값은 가상) | 참고용 |
 | `test_gqd.py` | 테스트 (의존성 없음) | 어디서든 |
@@ -258,6 +259,22 @@ Kubeflow 노트북 pod에는 보통 네임스페이스 편집 권한을 가진 �
 
 이 설정은 편의와 사고 방지용이다. 보안 경계는 6단계가 담당한다.
 
+#### 작업 상태를 세션 안에서 보기 (선택)
+
+`mod/`는 Claude Code 모드다. 각 세션의 작업 폴더 아래에서 낸 gq 작업을 프롬프트 위에 한 줄씩 보여 주고(이름, 상태, 경과 시간, GPU), 상태 표시줄에 gq 전체 GPU 사용량과 이 프로젝트의 실행·대기 수를 띄운다. 이 세션이 지켜보던 작업이 끝나면 토스트로 알린다. 1분마다 `gq ps --json --under <세션 폴더>`와 `gq capacity --json`을 읽기만 한다.
+
+`gqctl install`이 모드를 `<root>/claude-plugin`에 복사한다. 노트북 터미널에서 한 번 등록한다.
+
+```bash
+claude plugin marketplace add <root>/claude-plugin
+```
+
+```bash
+claude plugin install gq-status@gq
+```
+
+그 뒤 새로 시작한 세션부터 보인다. 이미 열린 세션은 `/reload-plugins`로 불러온다. 다음 `gqctl install`이 폴더를 바꾸면 세션이 새로 시작할 때 새 버전을 읽는다. 표시줄과 프롬프트 위 줄을 그리는지는 클라이언트마다 다르니, 휴대폰(Remote Control)에서는 직접 확인한다.
+
 ## 사용법
 
 ### 기본
@@ -269,7 +286,7 @@ gq submit --gpus 2 --time 6h --name my-eval -- python eval.py --model llama3-8b 
 gq wait <id> --timeout 30m                               # 끝날 때까지 대기 (exit code = 작업 결과)
 gq logs <id> -f                                          # 로그 따라가기
 gq status <id>                                           # 상태 (--json 가능)
-gq ps                                                    # 최근 24시간 작업 (--all, --mine, --json)
+gq ps                                                    # 최근 24시간 작업 (--all, --mine, --under DIR, --json)
 gq kill <id>                                             # 중지 (배열 그룹 id면 전체)
 ```
 
@@ -552,6 +569,16 @@ pod 작업은 노트북이 마운트한 볼륨 위에서만 실행할 수 있다
 
 ```bash
 python3 test_gqd.py
+```
+
+모드 테스트와 검사는 Claude Code가 돌린다.
+
+```bash
+claude plugin validate mod
+```
+
+```bash
+claude plugin test mod
 ```
 
 ### 실제 클러스터 대상 dry-run
